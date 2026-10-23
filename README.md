@@ -37,6 +37,8 @@ Drill into one agent for a timestamped timeline of every command and file it tou
 
 The same tracker as a VS Code sidebar, under [`vscode-extension/`](vscode-extension):
 
+![The Agents sidebar in VS Code: two agents need you, a file conflict, failing tests, and notifications](docs/vscode.png)
+
 - an **Agents** view in the activity bar: one row per agent with a status icon, project, context %, and current action. Expand a row for its todo list and last 30 actions; hover for model, context window, tokens, and errors
 - a **status bar** item with how many agents are working, need you, or conflict. It turns yellow when something needs you
 - **notifications** when an agent needs you, finishes, or a file conflict appears
