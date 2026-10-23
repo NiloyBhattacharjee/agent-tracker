@@ -82,4 +82,22 @@ assert tracker.errors(a) == (1, 1)
 assert list(a["edits"]) == [os.path.normcase(os.path.normpath("/proj/src/app.py"))]
 assert abs(a["cost"] - (400 * 1.25 + 50 * 0.125 + 50 * 10) / 1e6) < 1e-12
 assert tracker.status(a, a["mtime"] + 200)[0] == "done"
+# cost: 1h cache writes bill at 2x input (Claude Code's default), 5m at 1.25x; fast mode doubles; web search $10/1k
+u = {"input_tokens": 1000, "cache_creation_input_tokens": 3000, "cache_read_input_tokens": 0, "output_tokens": 0,
+     "cache_creation": {"ephemeral_5m_input_tokens": 1000, "ephemeral_1h_input_tokens": 2000}}
+assert abs(tracker.claude_cost(u, "claude-opus-5-5") - (1000 * 4 + 1000 * 5 + 2000 * 8) / 1e6) < 1e-12
+assert abs(tracker.claude_cost(dict(u, speed="fast"), "claude-opus-5-5") - 2 * (1000 * 4 + 1000 * 5 + 2000 * 8) / 1e6) < 1e-12
+assert abs(tracker.claude_cost({"server_tool_use": {"web_search_requests": 3}}, "claude-sonnet-5-5") - 0.03) < 1e-12
+assert tracker.claude_cost(u, "some-unknown-model") is None
+big = {"input_tokens": 150_000, "output_tokens": 1000}
+assert abs(tracker.claude_cost(big, "claude-haiku-5-5") - (150_000 * 0.5 + 1000 * 2.5) / 1e6) < 1e-12
+
+# alerts fire only on transitions: into needs, working → done, new conflicts
+x = run([call(1, "Edit", {"file_path": "/x/proj/app.py"})], tracker.parse_claude)
+y = run([call(1, "Write", {"file_path": "/x/proj/app.py"})], tracker.parse_claude)
+st = {x["path"]: ("needs", "approve? Edit: app.py"), y["path"]: ("done", "")}
+clash = {"app.py": [x, y]}
+got = tracker.alerts([x, y], st, clash, {x["path"]: ("working", ""), y["path"]: ("working", "")}, {})
+assert [t for t, _ in got] == ["⚠ proj: agent needs you", "✓ proj: agent finished", "⚡ File conflict"], got
+assert tracker.alerts([x, y], st, clash, st, clash) == []  # nothing changed → no alerts
 print("ok")

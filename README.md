@@ -29,7 +29,7 @@ In a real terminal it's color-coded. The title bar turns **red** when an agent n
 | MODEL | model of the latest turn: Opus, Sonnet, Haiku, GPT-5.x, … |
 | CONTEXT | how full the context window is right now (1M for current Claude models; Codex reports its own) |
 | TOTAL | all tokens processed, including cached input |
-| COST | estimated $ at API list prices, with cache reads and writes priced separately |
+| COST | $ at API prices, computed per response the way Claude Code's `/cost` does ([accuracy](#cost-accuracy)) |
 | ERR | failed tool calls (non-zero exit codes, failed edits, rejected calls). **Red** = 3+ of its last 5 calls failed, so it's probably looping |
 | AGO | time since its last action |
 | DOING | the task it marked in-progress, else its last tool call (`Bash: npm test`, `Edit: src/app.ts`). For a blocked agent: the question it asked or the call waiting for approval |
@@ -71,7 +71,55 @@ How the signals are derived:
 - **Needs you:** the agent asked a question (`AskUserQuestion`, `ExitPlanMode`, Codex `request_user_input`), or a tool call has no result after 20s (90s for shell commands, subagents, and web calls, which can legitimately run long). An agent at a permission prompt looks exactly like this. A shell command that runs longer than 90s will also show up here, so the label reads `approve?`.
 - **Conflicts:** two agents' file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`, Codex `apply_patch`) hit the same path within an hour. Edits made through shell commands (`sed -i`, `>`) aren't detected.
 - **Errors:** Claude Code's `is_error` tool results, and Codex non-zero exit codes.
-- **Cost:** per-message token usage × per-model price, from the `PRICES` table in `tracker.py`. Claude prices are Anthropic's API list prices. GPT-5.x uses GPT-5 list pricing as an estimate. If you're on a subscription plan, read this as "what it would cost on the API".
+- **Cost:** see [Cost accuracy](#cost-accuracy).
+
+## Desktop notifications
+
+While the live dashboard is running, you get a native desktop notification when:
+
+- **⚠ an agent needs you:** it asked a question or is waiting on a permission prompt
+- **✓ an agent finished its turn** and is waiting for your next prompt
+- **⚡ a new file conflict appears**
+
+Each one says which project and agent, plus the question or the waiting command. Notifications only fire on *changes*, so an agent that stays blocked doesn't spam you. Starting the tracker doesn't replay old states either.
+
+| OS | Mechanism (no install needed) |
+|---|---|
+| Windows | native toast via PowerShell |
+| macOS | Notification Center via `osascript` |
+| Linux | `notify-send` (libnotify) |
+
+```bash
+agents --test-notify   # send a test notification
+agents --no-notify     # dashboard only, no notifications
+```
+
+## Cost accuracy
+
+**Claude Code** costs are computed per API response from the exact usage the transcript records. The pricing rules match Claude Code's own `/cost`:
+
+- input, output, and cache reads at the model's rate
+- cache writes at **1.25×** input for 5-minute entries and **2×** for 1-hour entries (Claude Code mostly writes 1-hour entries)
+- **fast mode** at 2×
+- web searches at $10 per 1,000
+- Haiku 5.5's higher rate above 100k prompt tokens
+
+Checked against the `cost-state` snapshots Claude Code itself writes into transcripts, the median difference is ~2%. Remaining gaps come from usage that isn't in the session transcript: subagents (they have their own rows) and Claude Code's small internal Haiku calls.
+
+**Codex** rollouts record cumulative input, cached input, and output tokens but no prices. Every `gpt-5.x` model uses GPT-5 list pricing ($1.25 / $10 / $0.125 per 1M) unless you add your model's real price.
+
+**To make prices exact for your setup** (a Codex model's real price, a negotiated enterprise rate, Bedrock/Vertex pricing, a new model), create `~/.agent-tracker/prices.json`. Each key is a model-name prefix, and each value is `[input, output, cache_read]` in $ per 1M tokens. Your entries override and extend the built-in table, and the longest matching prefix wins:
+
+```json
+{
+  "gpt-5.3-codex": [1.25, 10.0, 0.125],
+  "claude-opus-5-5": [4.0, 20.0, 0.20]
+}
+```
+
+The numbers above are only an example; take real ones from your provider's pricing page. A model with no matching price shows `–` instead of a guess.
+
+**On a subscription** (Claude Pro/Max, ChatGPT Plus/Pro), you don't pay per token. COST is then what the same work would cost at API rates, which is useful for comparing agents but not a bill. For your actual API bill, use the Anthropic Console's usage page (or the Admin API's usage and cost report) and the OpenAI dashboard. Those give org-level totals, not per-session ones.
 
 ## Install
 
@@ -98,6 +146,8 @@ agents --hours 2       # change the time window
 agents --once          # print once and exit (pipe-friendly, no colors when piped)
 agents -n 5            # refresh every 5s
 agents 4cf2f29c        # timeline + todos for one agent (any id prefix)
+agents --no-notify     # live dashboard without desktop notifications
+agents --test-notify   # check notifications work on this machine
 ```
 
 Set `NO_COLOR=1` to disable colors. Thresholds (`STUCK_SECS`, `SLOW_STUCK_SECS`, `CONFLICT_SECS`, `ACTIVE_SECS`) and prices (`PRICES`) are constants at the top of `tracker.py`.

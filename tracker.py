@@ -7,7 +7,7 @@
   agents --hours 2       # change the time window
   agents 5aeb0dda        # timeline for one agent (session id prefix)
 """
-import argparse, glob, json, os, re, sys, time
+import argparse, glob, json, os, re, subprocess, sys, time
 from datetime import datetime
 
 ACTIVE_SECS = 90  # transcript written within this window = agent is working
@@ -21,7 +21,8 @@ _cache = {}  # path -> (mtime, size, parsed)
 CTX_1M = ("claude-fable", "claude-mythos", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
           "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-5")
 
-# $ per 1M tokens: input, output, cache read (cache writes bill at 1.25x input). Longest matching prefix wins.
+# $ per 1M tokens: input, output, cache read (cache writes bill at 1.25x input for 5m, 2x for 1h).
+# Longest matching prefix wins. Override or extend in ~/.agent-tracker/prices.json: {"<model prefix>": [input, output, cache_read]}
 PRICES = {
     "claude-fable-5-1": (10, 50, 0.25), "claude-mythos-5-1": (10, 50, 0.25),
     "claude-fable-5": (10, 50, 1.0), "claude-mythos-5": (10, 50, 1.0),
@@ -29,8 +30,14 @@ PRICES = {
     "claude-opus-4-7": (5, 25, 0.50), "claude-opus-4-6": (5, 25, 0.50),
     "claude-sonnet-5": (2, 10, 0.20), "claude-sonnet-4-6": (3, 15, 0.30),
     "claude-haiku-5-5": (0.10, 0.50, 0.01), "claude-haiku-4-5": (1, 5, 0.10),
-    "gpt-5": (1.25, 10, 0.125),  # ponytail: GPT-5 list price applied to every gpt-5.x model; add rows as OpenAI reprices
+    "gpt-5": (1.25, 10, 0.125),  # GPT-5 list price, used for every gpt-5.x without its own row
 }
+PRICES_FILE = os.path.expanduser("~/.agent-tracker/prices.json")
+try:
+    with open(PRICES_FILE, encoding="utf-8") as f:
+        PRICES.update({k: tuple(v) for k, v in json.load(f).items() if isinstance(v, list) and len(v) == 3})
+except (OSError, ValueError, AttributeError):
+    pass  # no file / bad JSON → built-in prices
 
 COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 PALETTE = ["36", "35", "33", "32", "34", "96", "95", "93"]
@@ -47,6 +54,18 @@ def c(code, s):
 def price(model):
     hits = [k for k in PRICES if model.startswith(k)]
     return PRICES[max(hits, key=len)] if hits else None
+
+
+def claude_cost(u, model):
+    """$ for one API response, priced like Claude Code's own /cost: 5m vs 1h cache writes, fast mode, web search."""
+    p = price(model)
+    if not p:
+        return None
+    inp, cw, cr, out = (u.get(k, 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"))
+    w1h = (u.get("cache_creation") or {}).get("ephemeral_1h_input_tokens", 0)
+    rate = (2 if u.get("speed") == "fast" else 1) * (5 if model.startswith("claude-haiku-5-5") and inp + cw + cr > 100_000 else 1)
+    searches = (u.get("server_tool_use") or {}).get("web_search_requests", 0)
+    return rate * (inp * p[0] + (cw - w1h) * p[0] * 1.25 + w1h * p[0] * 2 + cr * p[2] + out * p[1]) / 1e6 + searches * 0.01
 
 
 def epoch(ts):
@@ -123,9 +142,9 @@ def parse_claude(f, a):
             a["ctx"] = inp + cw + cr + out
             a["out"] += out
             a["tokens"] += inp + cw + cr + out
-            p = price(m.get("model") or "")
-            if p:
-                a["cost"] += (inp * p[0] + cw * p[0] * 1.25 + cr * p[2] + out * p[1]) / 1e6
+            cost = claude_cost(u, m.get("model") or "")
+            if cost is not None:
+                a["cost"] += cost
             elif inp + cw + cr + out:
                 a["unpriced"] = True
         a["ended"] = m.get("stop_reason") == "end_turn"
@@ -347,8 +366,8 @@ def table(hours, proj):
         kind, detail = st[a["path"]]
         on = kind in ("needs", "working")
         doing, nxt = doing_next(a)
-        proj_name = os.path.basename(a["cwd"].rstrip("/\\")) or a["cwd"]
-        name = ("↳ " if a["sub"] else "") + a["id"][:8] + (" ⚡" if a["path"] in clashing else "")
+        proj_name = project(a)
+        name =("↳ " if a["sub"] else "") + a["id"][:8] + (" ⚡" if a["path"] in clashing else "")
         n_err, recent = errors(a)
         err = c("1;91", f"{n_err:>4}") if recent >= 3 else c("33", f"{n_err:>4}") if n_err else c("90", f"{'·':>4}")
         out.append(
@@ -368,6 +387,54 @@ def table(hours, proj):
         who = ", ".join(f"{a['id'][:8]} ({ago(now - a['edits'][path])} ago)" for a in ags)
         out.append(c("1;93", f"   ⚡ {short_path(path)}") + c("90", "  edited by ") + who)
     print("\n".join(out))
+    return rows, st, clash
+
+
+def project(a):
+    return os.path.basename(a["cwd"].rstrip("/\\")) or a["cwd"]
+
+
+def alerts(rows, st, clash, prev_st, prev_clash):
+    """→ [(title, body)] for state changes since the last frame: blocked on you, finished a turn, new file conflict."""
+    out = []
+    for a in rows:
+        kind, detail = st[a["path"]]
+        was = prev_st.get(a["path"], ("",))[0]
+        if kind == "needs" and was != "needs":
+            out.append((f"⚠ {project(a)}: agent needs you", f"{a['id'][:8]}  {detail}"))
+        elif kind == "done" and was == "working":
+            out.append((f"✓ {project(a)}: agent finished", f"{a['id'][:8]}  {a['title'] or doing_next(a)[0]}"))
+    for path in clash.keys() - prev_clash.keys():
+        out.append(("⚡ File conflict", f"{short_path(path)} edited by " + ", ".join(a["id"][:8] for a in clash[path])))
+    return out
+
+
+# title/body arrive via env vars, never spliced into the script, so transcript text can't inject PowerShell
+WIN_TOAST = """
+$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+$t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$n = $t.GetElementsByTagName('text')
+$null = $n.Item(0).AppendChild($t.CreateTextNode($env:AT_TITLE))
+$null = $n.Item(1).AppendChild($t.CreateTextNode($env:AT_BODY))
+$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show([Windows.UI.Notifications.ToastNotification]::new($t))
+"""
+
+
+def notify(title, body):
+    """Fire-and-forget desktop notification: Windows toast, macOS Notification Center, Linux notify-send."""
+    quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        if sys.platform == "win32":
+            subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-Command", WIN_TOAST],
+                             env=dict(os.environ, AT_TITLE=title, AT_BODY=body), creationflags=0x08000000, **quiet)  # no console window
+        elif sys.platform == "darwin":
+            subprocess.Popen(["osascript", "-e", "on run a", "-e", "display notification (item 2 of a) with title (item 1 of a)",
+                              "-e", "end run", title, body], **quiet)
+        else:
+            subprocess.Popen(["notify-send", "-a", "agent-tracker", title, body], **quiet)
+    except OSError:
+        pass  # no notifier installed; the dashboard still shows everything
 
 
 def timeline(prefix, n=40):
@@ -405,7 +472,11 @@ def main():
     ap.add_argument("--hours", type=float, default=24)
     ap.add_argument("--once", action="store_true")
     ap.add_argument("-n", type=float, default=2, help="refresh seconds")
+    ap.add_argument("--no-notify", action="store_true", help="no desktop notifications in live mode")
+    ap.add_argument("--test-notify", action="store_true", help="send a test notification and exit")
     args = ap.parse_args()
+    if args.test_notify:
+        return notify("⚠ agent-tracker: test", "Notifications work. You'll get one like this when an agent needs you.")
     if args.here:
         args.project = os.getcwd()
     sys.stdout.reconfigure(encoding="utf-8")
@@ -416,10 +487,15 @@ def main():
         table(args.hours, args.project)
     else:
         print("\033[?25l", end="")  # hide cursor
+        prev = None  # first frame only sets the baseline, so starting the tracker doesn't replay old states
         try:
             while True:
                 print("\033[H\033[J", end="")
-                table(args.hours, args.project)
+                rows, st, clash = table(args.hours, args.project)
+                if prev and not args.no_notify:
+                    for title, body in alerts(rows, st, clash, *prev):
+                        notify(title, body)
+                prev = st, clash
                 time.sleep(args.n)
         except KeyboardInterrupt:
             pass
