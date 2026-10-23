@@ -30,7 +30,10 @@ jobs:
       - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" vscode-extension/*.vsix --generate-notes
+        # re-runs (e.g. after fixing a token) reuse the existing release instead of failing
+        run: |
+          gh release create "$GITHUB_REF_NAME" vscode-extension/*.vsix --generate-notes ||
+            gh release upload "$GITHUB_REF_NAME" vscode-extension/*.vsix --clobber
       - name: Publish to VS Code Marketplace
         if: env.VSCE_PAT != ''
         working-directory: vscode-extension
