@@ -84,7 +84,7 @@ How the signals are derived:
 
 ![Closing an agent: shows what it is doing, asks to confirm, then prints the command to resume it](docs/kill.png)
 
-Claude Code records each running session in `~/.claude/sessions/<pid>.json`, including the process start time. Before closing anything, `agent-tracker` checks that the PID is still that exact process, so a PID the OS has reused for something else is never touched. On macOS and Linux it checks that the process is still a `claude`/`node` binary. It checks again right before killing. The agent's process and the shell commands it started are terminated (`taskkill /T` on Windows, `SIGTERM` elsewhere). The transcript stays, so `claude --resume` picks the session back up. Add `-y` to skip the confirmation.
+Claude Code records each running session in `~/.claude/sessions/<pid>.json`, including the process start time. Before closing anything, `agent-tracker` checks that the PID is still that exact process, so a PID the OS has reused for something else is never touched. On macOS and Linux it checks that the process is still a `claude`/`node` binary. It checks again right before killing. The agent's process and the shell commands it started are terminated (`taskkill /T` on Windows, `SIGTERM` elsewhere). The transcript stays, so `claude --resume` picks the session back up. Add `-y` to skip the confirmation. In the live dashboard, select an agent and press `k`.
 
 Only Claude Code sessions can be closed this way: Codex and Copilot don't record which process owns a session. Subagents run inside their parent, so close the parent.
 
@@ -129,6 +129,18 @@ python agent-tracker/tracker.py
 ```
 
 ## Usage
+
+The live dashboard is clickable, like the VS Code sidebar:
+
+| Key / mouse | Does |
+|---|---|
+| `↑` `↓`, mouse wheel, or **click** a row | select an agent |
+| `Enter` or **click it again** | open its timeline and todos (`Esc` or a click goes back) |
+| `k` | close the selected agent (asks first, same checks as `--kill`) |
+| `Esc` | clear the selection |
+| `q` or `Ctrl+C` | quit (your terminal and scrollback are restored) |
+
+Clicks work in Windows Terminal, the VS Code terminal, iTerm2, and most Linux terminals. While the dashboard runs, the terminal sends clicks to it, so to select text hold `Shift` while dragging.
 
 ```bash
 agents                 # live dashboard, all agents active in the last 24h

@@ -106,6 +106,10 @@ got = tracker.alerts(([x_full], st, {}, limits), ([x], st, {}, [("5h", 60.0, Non
 assert [t for t, _ in got] == ["◔ proj: context 85% full", "⏳ Codex 5h limit 85% used"], got
 assert tracker.alerts(([x_full], st, {}, limits), ([x_full], st, {}, limits)) == []
 
+# live-mode input: arrows (VT and Windows console), SGR mouse press/release/wheel, Enter/Esc/letters
+assert tracker.keys("\x1b[A\x1b[B\xe0H\xe0P\r\x1bK") == [("up", 0), ("down", 0), ("up", 0), ("down", 0), ("enter", 0), ("esc", 0), ("k", 0)]
+assert tracker.keys("\x1b[<0;12;7M\x1b[<0;12;7m\x1b[<64;1;1M\x1b[<65;1;1M") == [("click", 7), ("up", 0), ("down", 0)]
+
 # copilot: replay the .jsonl mutation log, folder from workspace.json, terminal exit codes, todo list
 ws = tempfile.mkdtemp()
 os.makedirs(os.path.join(ws, "h", "chatSessions"))

@@ -1,6 +1,7 @@
 """Agent tracker: live view of every coding agent (Claude Code, Codex, Copilot) in CLI, VS Code or desktop, from local transcripts.
 
   agents                 # live table of agents active in last 24h, refreshes every 2s
+                         #   ↑↓ or click to select, Enter/click again for its timeline, k to close it, q to quit
   agents --once          # print once and exit
   agents -p erp          # only projects whose path contains "erp"
   agents --here          # only agents running in the current directory
@@ -585,7 +586,9 @@ def as_json(hours, proj):
                       "limits": [dict(window=w, used=u, resets_at=r) for w, u, r in limits]}), flush=True)
 
 
-def table(hours, proj):
+def table(hours, proj, sel=None, fit=None):
+    """Print the dashboard. sel = selected agent id; fit = screen height (only the rows that fit are shown).
+    → ((rows, st, clash, limits), screen line of the first agent row, the agents shown)"""
     rows, st, clash, pids, limits, now = snapshot(hours, proj)
     clashing = {a["path"] for ags in clash.values() for a in ags}
     w = os.get_terminal_size().columns if sys.stdout.isatty() else 200
@@ -604,7 +607,10 @@ def table(hours, proj):
     out.append(c("1;90", f"   {'AGENT':13}{'WHERE':15}{'PROJECT':20}{'MODEL':14}{'CONTEXT':16}{'TOTAL':>7}{'ERR':>4}"
                          f"{'AGO':>5}{'PID':>7}  {'DOING':{flex}}  NEXT"))
     icons = {"needs": c("1;91", "⚠"), "working": c("1;92", "●"), "done": c("36", "✓"), "idle": c("90", "○")}
-    for a in rows:
+    top = len(out) + 1
+    # leave room for the "more" line, conflict lines and the key hints, so a clicked line maps to its row
+    shown = rows[:max(1, fit - top - min(len(clash), 8) - 2)] if fit else rows
+    for a in shown:
         kind, detail = st[a["path"]]
         on = kind in ("needs", "working")
         doing, nxt = doing_next(a)
@@ -614,8 +620,8 @@ def table(hours, proj):
         compacted = f"⟳{a['compactions']}" if a["compactions"] else ""
         err = c("1;91", f"{n_err:>4}") if recent >= 3 else c("33", f"{n_err:>4}") if n_err else c("90", f"{'·':>4}")
         out.append(
-            " " + icons[kind] + " "
-            + c("1;97" if on else "37", f"{name:13}")
+            (c("1;96", "▶") if a["id"] == sel else " ") + icons[kind] + " "
+            + c("1;7" if a["id"] == sel else "1;97" if on else "37", f"{name:13}")
             + c(SRC_COLOR.get(a["src"], "37"), f"{a['src']:8}") + c("90", f"{clip(a['where'], 6):7}")
             + c(PALETTE[sum(map(ord, proj_name)) % len(PALETTE)], f"{clip(proj_name, 19):20}")
             + c("90", f"{clip(a['model'].replace('claude-', ''), 13):14}")
@@ -627,11 +633,13 @@ def table(hours, proj):
             + "  " + c("95", "→ " + clip(nxt, flex - 2) if nxt else ""))
     if not rows:
         out.append(c("90", f"   no agents in the last {hours:g}h" + (f" matching {proj!r}" if proj else "")))
+    elif len(shown) < len(rows):
+        out.append(c("90", f"   … {len(rows) - len(shown)} more (narrow it with -p or --hours, or enlarge the window)"))
     for path, ags in sorted(clash.items())[:8]:
         who = ", ".join(f"{a['id'][:8]} ({ago(now - a['edits'][path])} ago)" for a in ags)
         out.append(c("1;93", f"   ⚡ {short_path(path)}") + c("90", "  edited by ") + who)
     print("\n".join(out))
-    return rows, st, clash, limits
+    return (rows, st, clash, limits), top, shown
 
 
 def project(a):
@@ -722,6 +730,129 @@ def timeline(prefix, n=40):
             print(f"   {mark} {c('90', t.get('content', '')) if s == 'completed' else t.get('content', '')}")
 
 
+MOUSE, NO_MOUSE = "\033[?1000h\033[?1006h", "\033[?1000l\033[?1006l"  # report clicks + wheel, SGR encoding
+KEY = re.compile(r"\x1b\[<(\d+);\d+;(\d+)([Mm])|\x1b[\[O][0-9;]*([A-Za-z~])|[\xe0\x00](.)|(.)", re.S)
+
+
+def keys(s):
+    """Raw terminal input → [(key, screen line)]: up, down, enter, esc, click (with its line), or the character typed."""
+    out = []
+    for m in KEY.finditer(s):
+        btn, line, press, csi, win, ch = m.groups()
+        if btn is not None:
+            if press == "M":
+                out.append({"0": ("click", int(line)), "64": ("up", 0), "65": ("down", 0)}.get(btn, ("", 0)))
+        elif csi or win:
+            out.append(({"A": "up", "B": "down", "H": "up", "P": "down"}.get(csi or win, ""), 0))
+        else:
+            out.append(({"\r": "enter", "\n": "enter", "\x1b": "esc"}.get(ch, ch.lower()), 0))
+    return out
+
+
+def raw_mode():
+    """Keys arrive one at a time, unechoed (and as VT sequences on Windows, mouse included). → function restoring the old mode."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        k.GetStdHandle.restype = wintypes.HANDLE
+        h, old = wintypes.HANDLE(k.GetStdHandle(-10)), wintypes.DWORD()
+        k.GetConsoleMode(h, ctypes.byref(old))
+        k.SetConsoleMode(h, 0x200 | 0x80 | 0x1)  # VT input, quick-edit off (so clicks reach us), ctrl+c still works
+        return lambda: k.SetConsoleMode(h, old)
+    import termios, tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    return lambda: termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def read_input(timeout):
+    """Wait up to timeout seconds; → whatever was typed or clicked ("" if nothing)."""
+    if sys.platform == "win32":
+        import msvcrt
+        end = time.time() + timeout
+        while time.time() < end:
+            if msvcrt.kbhit():
+                s = ""
+                while msvcrt.kbhit():
+                    s += msvcrt.getwch()
+                return s
+            time.sleep(.03)
+        return ""
+    import select
+    if select.select([sys.stdin], [], [], timeout)[0]:
+        return os.read(sys.stdin.fileno(), 1024).decode(errors="ignore")
+    return ""
+
+
+def close_from_live(agent, restore):
+    """Leave raw mode for kill_agent's y/N prompt, then go back. → the new restore function."""
+    restore()
+    print(NO_MOUSE + "\033[H\033[J\033[?25h", end="")
+    try:
+        kill_agent(agent, False)
+    except SystemExit as e:  # not running, not a Claude agent, ...
+        print(e)
+    input(c("90", "\npress Enter to go back "))
+    print("\033[?25l" + MOUSE, end="")
+    return raw_mode()
+
+
+def live(args):
+    """Refreshing dashboard. In a real terminal it's interactive: ↑↓ or click selects a row, Enter or a second click
+    opens its timeline, k closes it, q quits. Notifications fire on state changes."""
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    restore = raw_mode() if interactive else (lambda: None)
+    print("\033[?1049h\033[?25l" + (MOUSE if interactive else ""), end="")  # alternate screen keeps your scrollback intact
+    prev = sel = None  # first frame only sets the baseline, so starting the tracker doesn't replay old states
+    view, ids, by_id = "table", [], {}
+    try:
+        while True:
+            h = os.get_terminal_size().lines if interactive else None
+            print("\033[H\033[J", end="")
+            if view == "timeline" and sel in by_id:
+                todos = len(by_id[sel]["todos"])
+                timeline(sel, max(5, h - 6 - (todos + 2 if todos else 0)))
+                hint = "esc or click: back · k close · q quit"
+            else:
+                view = "table"
+                cur, top, shown = table(args.hours, args.project, sel, h)
+                ids, by_id = [a["id"] for a in shown], {a["id"]: a for a in shown}
+                if prev and not args.no_notify:
+                    for title, body in alerts(cur, prev):
+                        notify(title, body)
+                prev = cur
+                hint = "↑↓ or click: select · enter or click again: timeline · k close · q quit"
+            if not interactive:
+                time.sleep(args.n)
+                continue
+            print(c("90", "\n " + hint), end="", flush=True)
+            for key, line in keys(read_input(args.n)):
+                if key == "q":
+                    return
+                if key == "k" and sel:
+                    restore = close_from_live(sel, restore)
+                elif view == "timeline":
+                    if key in ("esc", "click", "enter"):
+                        view = "table"
+                elif key in ("up", "down") and ids:
+                    i = ids.index(sel) if sel in ids else -1
+                    sel = ids[max(0, i - 1)] if key == "up" else ids[min(len(ids) - 1, i + 1)]
+                elif key == "click" and 0 <= line - top < len(ids):
+                    view = "timeline" if ids[line - top] == sel else view
+                    sel = ids[line - top]
+                elif key == "enter" and sel in ids:
+                    view = "timeline"
+                elif key == "esc":
+                    sel = None
+    except KeyboardInterrupt:
+        pass
+    finally:
+        restore()
+        print(NO_MOUSE + "\033[?25h\033[?1049l", end="", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="agents", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("agent", nargs="?", help="session id prefix → show its timeline")
@@ -756,21 +887,7 @@ def main():
     elif args.once:
         table(args.hours, args.project)
     else:
-        print("\033[?25l", end="")  # hide cursor
-        prev = None  # first frame only sets the baseline, so starting the tracker doesn't replay old states
-        try:
-            while True:
-                print("\033[H\033[J", end="")
-                cur = table(args.hours, args.project)
-                if prev and not args.no_notify:
-                    for title, body in alerts(cur, prev):
-                        notify(title, body)
-                prev = cur
-                time.sleep(args.n)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            print("\033[?25h", end="")
+        live(args)
 
 
 if __name__ == "__main__":
