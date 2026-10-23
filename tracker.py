@@ -6,8 +6,9 @@
   agents --here          # only agents running in the current directory
   agents --hours 2       # change the time window
   agents 5aeb0dda        # timeline for one agent (session id prefix)
+  agents --kill 5aeb0dda # close a running Claude Code agent (asks first)
 """
-import argparse, glob, json, os, re, subprocess, sys, time
+import argparse, glob, json, os, re, signal, subprocess, sys, time
 from datetime import datetime
 
 ACTIVE_SECS = 90  # transcript written within this window = agent is working
@@ -253,6 +254,94 @@ def files():
             yield p, src, parser
 
 
+SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")  # Claude Code writes <pid>.json per running process
+
+
+def win_proc_start(pid):
+    """Creation time of a running Windows process as FILETIME (what Claude Code stores as procStart), else None."""
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.windll.kernel32
+    h = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return None
+    try:
+        code, times = wintypes.DWORD(), [wintypes.FILETIME() for _ in range(4)]
+        if not k.GetExitCodeProcess(h, ctypes.byref(code)) or code.value != 259:  # STILL_ACTIVE
+            return None
+        if not k.GetProcessTimes(h, *(ctypes.byref(t) for t in times)):
+            return None
+        return str(times[0].dwHighDateTime << 32 | times[0].dwLowDateTime)
+    finally:
+        k.CloseHandle(h)
+
+
+def alive(pid, proc_start):
+    """True if pid is still the process that wrote the session file (guards against PID reuse)."""
+    if sys.platform == "win32":  # never os.kill() on Windows: any signal there terminates the process
+        return proc_start is not None and win_proc_start(pid) == str(proc_start)
+    try:
+        os.kill(pid, 0)  # signal 0 = existence check only
+    except OSError:
+        return False
+    # ponytail: POSIX checks the binary name instead of matching procStart; compare start times if PID reuse bites
+    comm = subprocess.run(["ps", "-p", str(pid), "-o", "comm="], capture_output=True, text=True).stdout
+    return "claude" in comm or "node" in comm
+
+
+def running():
+    """→ {session_id: pid} for Claude Code sessions whose process is alive right now."""
+    out = {}
+    for f in glob.glob(os.path.join(SESSIONS_DIR, "*.json")):
+        try:
+            with open(f, encoding="utf-8") as fh:
+                s = json.load(fh)
+            pid = int(s["pid"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if alive(pid, s.get("procStart")):
+            out[s.get("sessionId")] = pid
+    return out
+
+
+def close(pid):
+    """Terminate an agent process and its child shells. → (ok, message)."""
+    if sys.platform == "win32":
+        r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True)
+        return r.returncode == 0, (r.stdout + r.stderr).strip()
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True, ""
+    except OSError as e:
+        return False, str(e)
+
+
+def kill_agent(prefix, yes):
+    hits = [h for h in files() if os.path.basename(h[0])[:-6][-36:].startswith(prefix)]
+    if len(hits) != 1:
+        sys.exit(f"{len(hits)} agents match {prefix!r}; give a longer id prefix" if hits else f"no agent matching {prefix!r}")
+    a = parse(*hits[0])
+    if a["src"] != "claude":
+        sys.exit(f"{a['id'][:8]} is a {a['src']} agent; only Claude Code sessions record their process id, so close it in its terminal")
+    if a["sub"]:
+        sys.exit(f"{a['id'][:8]} is a subagent; it runs inside its parent session, so close the parent instead")
+    pid = running().get(a["id"])
+    if not pid:
+        sys.exit(f"{a['id'][:8]} isn't running (no live Claude Code process for this session)")
+    kind, detail = status(a, time.time())
+    print(f"{c('1', a['id'][:8])}  {project(a)}  pid {pid}  {a['title']}\n"
+          f"  {kind}: {clip(detail or doing_next(a)[0], 100)}\n  {fmt_n(a['tokens'])} tokens · {fmt_cost(a)}")
+    if not yes and input("Close this agent? Unsaved work in progress stops mid-step. [y/N] ").strip().lower() != "y":
+        return print("cancelled")
+    if running().get(a["id"]) != pid:  # re-check right before killing
+        sys.exit("process changed or exited; nothing closed")
+    ok, msg = close(pid)
+    if not ok:
+        sys.exit(f"failed to close pid {pid}: {msg}")
+    print(c("32", f"closed {a['id'][:8]} (pid {pid}).") + f" Its transcript is kept; resume it with:\n"
+          f"  cd {a['cwd']} && claude --resume {a['id']}")
+
+
 def status(a, now):
     """→ (kind, detail): needs (blocked on you), working, done (turn finished), idle."""
     age = now - a["mtime"]
@@ -351,8 +440,9 @@ def table(hours, proj):
     rows.sort(key=lambda a: st[a["path"]][0] != "needs")  # stable: blocked agents first, then most recent
     clash = conflicts(rows, now)
     clashing = {a["path"] for ags in clash.values() for a in ags}
+    pids = running()
     w = os.get_terminal_size().columns if sys.stdout.isatty() else 200
-    flex = max(20, (w - 100) // 2)
+    flex = max(20, (w - 107) // 2)
     live = sum(s[0] == "working" for s in st.values())
     needs = sum(s[0] == "needs" for s in st.values())
     title = (f" ◆ AGENT TRACKER   {len(rows)} agents · {live} working · {needs} need you · {len(clash)} conflicts · "
@@ -360,7 +450,7 @@ def table(hours, proj):
     clock = f"{datetime.now():%H:%M:%S}  ctrl+c to quit "
     out = [c("1;97;41" if needs or clash else "1;97;44", title + " " * max(1, w - len(title) - len(clock)) + clock), ""]
     out.append(c("1;90", f"   {'AGENT':13}{'CLI':7}{'PROJECT':20}{'MODEL':14}{'CONTEXT':13}{'TOTAL':>7}{'COST':>8}{'ERR':>4}"
-                         f"{'AGO':>5}  {'DOING':{flex}}  NEXT"))
+                         f"{'AGO':>5}{'PID':>7}  {'DOING':{flex}}  NEXT"))
     icons = {"needs": c("1;91", "⚠"), "working": c("1;92", "●"), "done": c("36", "✓"), "idle": c("90", "○")}
     for a in rows:
         kind, detail = st[a["path"]]
@@ -378,7 +468,8 @@ def table(hours, proj):
             + c("90", f"{clip(a['model'].replace('claude-', ''), 13):14}")
             + bar(a["ctx"], a["cap"]) + f" {fmt_n(a['ctx']):>5} "
             + c("1", f"{fmt_n(a['tokens']):>7}") + f"{fmt_cost(a):>8}" + err
-            + c("92" if on else "90", f"{ago(now - a['mtime']):>5}") + "  "
+            + c("92" if on else "90", f"{ago(now - a['mtime']):>5}")
+            + (c("37", f"{pids[a['id']]:>7}") if a["id"] in pids else c("90", f"{'·':>7}")) + "  "
             + (c("1;91", clip(detail, flex).ljust(flex)) if kind == "needs" else action(doing, flex, dim=not on))
             + "  " + c("95", "→ " + clip(nxt, flex - 2) if nxt else ""))
     if not rows:
@@ -444,11 +535,13 @@ def timeline(prefix, n=40):
     a, now = parse(*hit), time.time()
     kind, detail = status(a, now)
     n_err, _ = errors(a)
+    pid = running().get(a["id"])
     print(c("1;97;44", f" ◆ {a['id']} ") + "  " + c(SRC_COLOR.get(a["src"], "37"), a["src"]) + "  " + c("1", a["title"] or "(untitled)"))
     state = {"needs": c("1;91", "⚠ needs you: " + detail), "working": c("1;92", "● working"),
              "done": c("36", "✓ done " + ago(now - a["mtime"])), "idle": c("90", "○ idle " + ago(now - a["mtime"]))}[kind]
     print(f"   {c('36', a['cwd'])}  {c('90', a['model'])}  context {bar(a['ctx'], a['cap'])} {fmt_n(a['ctx'])}  "
-          f"total {c('1', fmt_n(a['tokens']))}  {fmt_cost(a)}  {c('91', str(n_err) + ' errors') if n_err else ''}  {state}\n")
+          f"total {c('1', fmt_n(a['tokens']))}  {fmt_cost(a)}  {c('91', str(n_err) + ' errors') if n_err else ''}  {state}"
+          f"{'  pid ' + str(pid) if pid else ''}\n")
     for ts, ev, ok, _ in a["events"][-n:]:
         try:
             ts = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%m-%d %H:%M:%S")
@@ -474,6 +567,8 @@ def main():
     ap.add_argument("-n", type=float, default=2, help="refresh seconds")
     ap.add_argument("--no-notify", action="store_true", help="no desktop notifications in live mode")
     ap.add_argument("--test-notify", action="store_true", help="send a test notification and exit")
+    ap.add_argument("--kill", metavar="ID", help="close a running Claude Code agent (asks first)")
+    ap.add_argument("-y", "--yes", action="store_true", help="with --kill: don't ask for confirmation")
     args = ap.parse_args()
     if args.test_notify:
         return notify("⚠ agent-tracker: test", "Notifications work. You'll get one like this when an agent needs you.")
@@ -481,7 +576,9 @@ def main():
         args.project = os.getcwd()
     sys.stdout.reconfigure(encoding="utf-8")
     os.system("")  # enables ANSI escapes on Windows consoles
-    if args.agent:
+    if args.kill:
+        kill_agent(args.kill, args.yes)
+    elif args.agent:
         timeline(args.agent)
     elif args.once:
         table(args.hours, args.project)

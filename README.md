@@ -73,6 +73,22 @@ How the signals are derived:
 - **Errors:** Claude Code's `is_error` tool results, and Codex non-zero exit codes.
 - **Cost:** see [Cost accuracy](#cost-accuracy).
 
+## Closing agents
+
+```
+$ agents --kill 4cf2f29c
+4cf2f29c  api-server  pid 8088  Add pagination to users API
+  working: Bash: pnpm test users
+  18.8M tokens · $7.90
+Close this agent? Unsaved work in progress stops mid-step. [y/N] y
+closed 4cf2f29c (pid 8088). Its transcript is kept; resume it with:
+  cd ~/code/api-server && claude --resume 4cf2f29c-a5e8-4cd9-b336-4122b00f809b
+```
+
+The **PID** column shows which agents have a live process. Claude Code records each running session in `~/.claude/sessions/<pid>.json`, including the process start time. Before closing anything, `agent-tracker` checks that the PID is still that exact process, so a PID the OS has reused for something else is never touched. It checks again right before killing. The agent's process and the shell commands it started are terminated (`taskkill /T` on Windows, `SIGTERM` elsewhere). The transcript stays, so `claude --resume` picks the session back up. Add `-y` to skip the confirmation.
+
+Only Claude Code sessions can be closed this way: Codex doesn't record which process owns a session. Subagents run inside their parent, so close the parent.
+
 ## Desktop notifications
 
 While the live dashboard is running, you get a native desktop notification when:
@@ -146,6 +162,7 @@ agents --hours 2       # change the time window
 agents --once          # print once and exit (pipe-friendly, no colors when piped)
 agents -n 5            # refresh every 5s
 agents 4cf2f29c        # timeline + todos for one agent (any id prefix)
+agents --kill 4cf2f29c # close a running Claude Code agent (shows what it's doing, asks first)
 agents --no-notify     # live dashboard without desktop notifications
 agents --test-notify   # check notifications work on this machine
 ```

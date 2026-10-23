@@ -1,4 +1,4 @@
-import json, os, tempfile
+import json, os, shutil, subprocess, sys, tempfile
 import tracker
 
 
@@ -100,4 +100,23 @@ clash = {"app.py": [x, y]}
 got = tracker.alerts([x, y], st, clash, {x["path"]: ("working", ""), y["path"]: ("working", "")}, {})
 assert [t for t, _ in got] == ["⚠ proj: agent needs you", "✓ proj: agent finished", "⚡ File conflict"], got
 assert tracker.alerts([x, y], st, clash, st, clash) == []  # nothing changed → no alerts
+
+# closing: a dummy process stands in for a Claude Code session (Windows: identity is checked via procStart)
+if sys.platform == "win32":
+    sid = "11111111-2222-3333-4444-555555555555"
+    tmp = tempfile.mkdtemp()
+    dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    tracker.SESSIONS_DIR = tmp
+    with open(os.path.join(tmp, f"{dummy.pid}.json"), "w") as f:
+        json.dump({"pid": dummy.pid, "sessionId": sid, "procStart": "1"}, f)
+    assert tracker.running() == {}, "wrong procStart must not match (PID reuse guard)"
+    with open(os.path.join(tmp, f"{dummy.pid}.json"), "w") as f:
+        json.dump({"pid": dummy.pid, "sessionId": sid, "procStart": tracker.win_proc_start(dummy.pid)}, f)
+    assert tracker.running() == {sid: dummy.pid}
+    with open(os.path.join(tmp, f"{sid}.jsonl"), "w") as f:
+        f.write(json.dumps(call(1, "Bash", {"command": "sleep"})))
+    tracker.SOURCES = [("claude", os.path.join(tmp, "*.jsonl"), tracker.parse_claude)]
+    tracker.kill_agent(sid[:8], yes=True)
+    assert dummy.wait(timeout=10) is not None and tracker.running() == {}
+    shutil.rmtree(tmp)
 print("ok")
