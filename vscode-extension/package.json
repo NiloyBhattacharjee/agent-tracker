@@ -1,5 +1,5 @@
 {
-  "name": "agent-tracker",
+  "name": "at-agent-tracker",
   "displayName": "AT Agent Tracker",
   "description": "See every coding agent (Claude Code, Codex, Copilot) across all your projects: what it's doing, its context window, which ones need you, and file conflicts.",
   "version": "0.1.0",

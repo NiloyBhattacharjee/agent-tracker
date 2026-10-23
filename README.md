@@ -67,14 +67,14 @@ The same tracker as a VS Code sidebar, under [`vscode-extension/`](vscode-extens
 - **✕** on a row closes that agent (asks first); the **history** button opens its timeline; the **terminal** button opens the full live table
 - a filter button for **only this workspace's agents**
 
-Install it from the VS Code Marketplace (search **AT Agent Tracker**) once published, or download the `.vsix` from the [latest release](https://github.com/NiloyBhattacharjee/agent-tracker/releases/latest) and run `code --install-extension agent-tracker-*.vsix`.
+Install it from the VS Code Marketplace (search **AT Agent Tracker**) once published, or download the `.vsix` from the [latest release](https://github.com/NiloyBhattacharjee/agent-tracker/releases/latest) and run `code --install-extension at-agent-tracker-*.vsix`.
 
 To build it yourself (needs Node.js):
 
 ```bash
 cd vscode-extension
-npx @vscode/vsce package          # → agent-tracker-0.1.0.vsix (bundles tracker.py)
-code --install-extension agent-tracker-0.1.0.vsix
+npx @vscode/vsce package          # → at-agent-tracker-0.1.0.vsix (bundles tracker.py)
+code --install-extension at-agent-tracker-0.1.0.vsix
 ```
 
 It needs Python 3.9+ on PATH, or set `agentTracker.pythonPath`. Under the hood it runs `tracker.py --json --stream`, a single long-running process that prints one JSON snapshot per refresh, so transcripts are only re-parsed when they change.
