@@ -7,11 +7,30 @@
   agents --hours 2       # change the time window
   agents 5aeb0dda        # timeline for one agent (session id prefix)
 """
-import argparse, glob, json, os, sys, time
+import argparse, glob, json, os, re, sys, time
 from datetime import datetime
 
 ACTIVE_SECS = 90  # transcript written within this window = agent is working
+STUCK_SECS = 20  # a quick tool (Edit, Read...) unanswered this long = waiting on a permission prompt
+SLOW_STUCK_SECS = 90  # same for tools that can legitimately run long (shell, subagents, web)
+SLOW_TOOLS = {"Bash", "PowerShell", "Agent", "Task", "WebFetch", "WebSearch", "Monitor", "shell", "shell_command"}
+ASK_TOOLS = {"AskUserQuestion", "ExitPlanMode", "request_user_input"}
+CONFLICT_SECS = 3600  # two agents editing the same file within this window = conflict
 _cache = {}  # path -> (mtime, size, parsed)
+# models with a 1M context window; everything else (and Codex, which reports its own) uses 200k
+CTX_1M = ("claude-fable", "claude-mythos", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+          "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-5")
+
+# $ per 1M tokens: input, output, cache read (cache writes bill at 1.25x input). Longest matching prefix wins.
+PRICES = {
+    "claude-fable-5-1": (10, 50, 0.25), "claude-mythos-5-1": (10, 50, 0.25),
+    "claude-fable-5": (10, 50, 1.0), "claude-mythos-5": (10, 50, 1.0),
+    "claude-opus-5-5": (4, 20, 0.20), "claude-opus-5": (5, 25, 0.50), "claude-opus-4-8": (5, 25, 0.50),
+    "claude-opus-4-7": (5, 25, 0.50), "claude-opus-4-6": (5, 25, 0.50),
+    "claude-sonnet-5": (2, 10, 0.20), "claude-sonnet-4-6": (3, 15, 0.30),
+    "claude-haiku-5-5": (0.10, 0.50, 0.01), "claude-haiku-4-5": (1, 5, 0.10),
+    "gpt-5": (1.25, 10, 0.125),  # ponytail: GPT-5 list price applied to every gpt-5.x model; add rows as OpenAI reprices
+}
 
 COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 PALETTE = ["36", "35", "33", "32", "34", "96", "95", "93"]
@@ -25,8 +44,23 @@ def c(code, s):
     return f"\033[{code}m{s}\033[0m" if COLOR else s
 
 
+def price(model):
+    hits = [k for k in PRICES if model.startswith(k)]
+    return PRICES[max(hits, key=len)] if hits else None
+
+
+def epoch(ts):
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return 0
+
+
 def summarize(name, inp):
-    for k in ("command", "file_path", "path", "pattern", "description", "url", "query", "prompt"):
+    if name in ("AskUserQuestion", "request_user_input") and isinstance(inp.get("questions"), list) and inp["questions"]:
+        q = inp["questions"][0]
+        return f"{name}: {q.get('question', '') if isinstance(q, dict) else q}"
+    for k in ("command", "file_path", "notebook_path", "path", "pattern", "description", "url", "query", "prompt"):
         v = inp.get(k)
         if isinstance(v, list):  # codex `shell` passes argv
             v = " ".join(map(str, v))
@@ -45,6 +79,19 @@ def jsonl(f):
             yield d
 
 
+def add_event(a, ts, name, inp, call_id):
+    """Record a tool call; it stays in a["pending"] until its result arrives."""
+    a["events"].append([ts, summarize(name, inp), None, name])  # [timestamp, summary, ok, tool]
+    if call_id:
+        a["pending"][call_id] = a["events"][-1]
+
+
+def finish_event(a, call_id, ok):
+    ev = a["pending"].pop(call_id, None)
+    if ev:
+        ev[2] = ok
+
+
 def parse_claude(f, a):
     seen = set()
     for d in jsonl(f):
@@ -57,8 +104,14 @@ def parse_claude(f, a):
         m = d.get("message")
         if not isinstance(m, dict):
             continue
-        if t == "user" and isinstance(m.get("content"), str) and not d.get("isMeta"):
-            a["prompt"] = m["content"]
+        content = m.get("content")
+        if t == "user":
+            if isinstance(content, str) and not d.get("isMeta"):
+                a["prompt"], a["ended"] = content, False
+            for b in content if isinstance(content, list) else []:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    finish_event(a, b.get("tool_use_id"), not b.get("is_error"))
+            continue
         if t != "assistant":
             continue
         a["model"] = m.get("model") or a["model"]
@@ -66,20 +119,41 @@ def parse_claude(f, a):
         # one API message is split across several records that repeat the same usage; count it once
         if u and m.get("id") not in seen:
             seen.add(m.get("id"))
-            ctx = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + u.get("cache_read_input_tokens", 0)
-            a["ctx"] = ctx + u.get("output_tokens", 0)
-            a["out"] += u.get("output_tokens", 0)
-            a["tokens"] += ctx + u.get("output_tokens", 0)
-        for b in m.get("content") or []:
+            inp, cw, cr, out = (u.get(k, 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"))
+            a["ctx"] = inp + cw + cr + out
+            a["out"] += out
+            a["tokens"] += inp + cw + cr + out
+            p = price(m.get("model") or "")
+            if p:
+                a["cost"] += (inp * p[0] + cw * p[0] * 1.25 + cr * p[2] + out * p[1]) / 1e6
+            elif inp + cw + cr + out:
+                a["unpriced"] = True
+        a["ended"] = m.get("stop_reason") == "end_turn"
+        for b in content if isinstance(content, list) else []:
             if isinstance(b, dict) and b.get("type") == "tool_use":
                 inp = b.get("input") or {}
                 if b["name"] == "TodoWrite" and isinstance(inp.get("todos"), list):
                     a["todos"] = inp["todos"]
-                a["events"].append((d.get("timestamp", ""), summarize(b["name"], inp)))
+                add_event(a, d.get("timestamp", ""), b["name"], inp, b.get("id"))
+                if b["name"] in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+                    path = inp.get("file_path") or inp.get("notebook_path")
+                    if isinstance(path, str):
+                        a["edits"][os.path.normcase(os.path.normpath(path))] = epoch(d.get("timestamp", ""))
+
+
+def codex_ok(output):
+    """Codex tool outputs are either 'Exit code: N\\n...' text or JSON with metadata.exit_code."""
+    if not isinstance(output, str):
+        return True
+    try:
+        return (json.loads(output).get("metadata") or {}).get("exit_code", 0) == 0
+    except (ValueError, AttributeError):
+        m = re.match(r"Exit code: (\d+)", output)
+        return not m or m.group(1) == "0"
 
 
 def parse_codex(f, a):
-    seen = set()
+    seen, tot = set(), {}
     for d in jsonl(f):
         p = d.get("payload")
         if not isinstance(p, dict):
@@ -87,7 +161,7 @@ def parse_codex(f, a):
         a["cwd"] = p.get("cwd") or a["cwd"]
         if d.get("type") == "turn_context":
             a["model"] = p.get("model") or a["model"]
-        pt = p.get("type")
+        pt, ts = p.get("type"), d.get("timestamp", "")
         if pt == "token_count" and isinstance(p.get("info"), dict):
             tot, last = p["info"].get("total_token_usage") or {}, p["info"].get("last_token_usage") or {}
             a["tokens"], a["out"] = tot.get("total_tokens", a["tokens"]), tot.get("output_tokens", a["out"])
@@ -95,6 +169,12 @@ def parse_codex(f, a):
             a["cap"] = p["info"].get("model_context_window") or a["cap"]
         elif pt == "user_message" and p.get("message"):
             a["prompt"] = p["message"]
+        elif pt == "task_started":
+            a["ended"] = False
+        elif pt == "task_complete":
+            a["ended"] = True
+        elif pt in ("function_call_output", "custom_tool_call_output"):
+            finish_event(a, p.get("call_id"), codex_ok(p.get("output")))
         elif pt in ("function_call", "custom_tool_call", "web_search_call"):
             if p.get("call_id") in seen:  # rollouts can log the same call twice
                 continue
@@ -106,13 +186,22 @@ def parse_codex(f, a):
                 except ValueError:
                     pass
             elif pt == "custom_tool_call":  # apply_patch: raw patch text
-                inp = {"command": str(p.get("input", "")).replace("*** Begin Patch", "")}
+                patch = str(p.get("input", ""))
+                inp = {"command": patch.replace("*** Begin Patch", "")}
+                for path in re.findall(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", patch, re.M):
+                    a["edits"][os.path.normcase(os.path.normpath(os.path.join(a["cwd"], path.strip())))] = epoch(ts)
             else:
                 inp = {"query": (p.get("action") or {}).get("query", "")}
             inp = inp if isinstance(inp, dict) else {}
             if name == "update_plan" and isinstance(inp.get("plan"), list):
                 a["todos"] = [{"content": s.get("step", ""), "status": s.get("status")} for s in inp["plan"] if isinstance(s, dict)]
-            a["events"].append((d.get("timestamp", ""), summarize(name, inp)))
+            add_event(a, ts, name, inp, p.get("call_id") if pt != "web_search_call" else None)
+    p = price(a["model"])
+    if p and tot:
+        cached = tot.get("cached_input_tokens", 0)
+        a["cost"] = ((tot.get("input_tokens", 0) - cached) * p[0] + cached * p[2] + tot.get("output_tokens", 0) * p[1]) / 1e6
+    elif a["tokens"]:
+        a["unpriced"] = True
 
 
 # add another agent CLI: a name, a glob for its transcripts, and a parser that fills the agent dict
@@ -128,11 +217,13 @@ def parse(path, src, parser):
     if hit and hit[:2] == (st.st_mtime, st.st_size):
         return hit[2]
     # ponytail: re-reads the whole file when it changes; tail-only incremental read if transcripts get huge
-    # ponytail: context bar defaults to a 200k window; per-model sizes if 1M-context Claude models matter
     a = dict(path=path, src=src, id=os.path.basename(path)[:-6][-36:], cwd="?", title="", model="", tokens=0,
-             ctx=0, cap=200_000, out=0, events=[], todos=[], prompt="", mtime=st.st_mtime, sub="subagents" in path)
+             ctx=0, cap=200_000, out=0, cost=0.0, unpriced=False, events=[], pending={}, edits={}, todos=[],
+             prompt="", ended=False, mtime=st.st_mtime, sub="subagents" in path)
     with open(path, encoding="utf-8", errors="ignore") as f:
         parser(f, a)
+    if a["model"].startswith(CTX_1M):
+        a["cap"] = 1_000_000
     _cache[path] = (st.st_mtime, st.st_size, a)
     return a
 
@@ -141,6 +232,37 @@ def files():
     for src, pattern, parser in SOURCES:
         for p in glob.glob(os.path.expanduser(pattern), recursive=True):
             yield p, src, parser
+
+
+def status(a, now):
+    """→ (kind, detail): needs (blocked on you), working, done (turn finished), idle."""
+    age = now - a["mtime"]
+    # ponytail: an unanswered call in a crashed session looks the same as a prompt; ignored after 1h
+    if a["pending"] and age < 3600:
+        for ev in a["pending"].values():
+            if ev[3] in ASK_TOOLS:
+                return "needs", "answer: " + ev[1].partition(": ")[2]
+            if age > (SLOW_STUCK_SECS if ev[3] in SLOW_TOOLS else STUCK_SECS):
+                return "needs", "approve? " + ev[1]
+    if age < ACTIVE_SECS:
+        return "working", ""
+    return ("done" if a["ended"] else "idle"), ""
+
+
+def errors(a):
+    """→ (total failed tool calls, failures among the last 5 finished calls)."""
+    done = [e[2] for e in a["events"] if e[2] is not None]
+    return done.count(False), done[-5:].count(False)
+
+
+def conflicts(rows, now):
+    """→ {path: [agent, ...]} for files edited by 2+ agents within CONFLICT_SECS."""
+    by_path = {}
+    for a in rows:
+        for path, ts in a["edits"].items():
+            if now - ts < CONFLICT_SECS:
+                by_path.setdefault(path, []).append(a)
+    return {p: ags for p, ags in by_path.items() if len(ags) > 1}
 
 
 def agents(hours, proj):
@@ -169,6 +291,12 @@ def fmt_n(n):
     return f"{n/1e6:.1f}M" if n >= 1e6 else f"{n/1e3:.0f}k" if n >= 1e3 else str(n)
 
 
+def fmt_cost(a):
+    if a["unpriced"] and not a["cost"]:
+        return "–"
+    return f"${a['cost']:.2f}" if a["cost"] < 100 else f"${a['cost']:.0f}"
+
+
 def ago(secs):
     secs = int(secs)
     return f"{secs}s" if secs < 60 else f"{secs//60}m" if secs < 3600 else f"{secs//3600}h" if secs < 172800 else f"{secs//86400}d"
@@ -177,6 +305,10 @@ def ago(secs):
 def clip(s, n):
     s = " ".join(str(s).split())
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def short_path(p, parts=3):
+    return os.sep.join(p.split(os.sep)[-parts:])
 
 
 def bar(n, cap, w=6):
@@ -196,31 +328,45 @@ def action(s, n, dim=False):
 
 def table(hours, proj):
     rows, now = agents(hours, proj), time.time()
+    st = {a["path"]: status(a, now) for a in rows}
+    rows.sort(key=lambda a: st[a["path"]][0] != "needs")  # stable: blocked agents first, then most recent
+    clash = conflicts(rows, now)
+    clashing = {a["path"] for ags in clash.values() for a in ags}
     w = os.get_terminal_size().columns if sys.stdout.isatty() else 200
-    flex = max(20, (w - 92) // 2)
-    live = sum(now - a["mtime"] < ACTIVE_SECS for a in rows)
-    title = f" ◆ AGENT TRACKER   {len(rows)} agents · {live} active · {fmt_n(sum(a['tokens'] for a in rows))} tokens"
+    flex = max(20, (w - 100) // 2)
+    live = sum(s[0] == "working" for s in st.values())
+    needs = sum(s[0] == "needs" for s in st.values())
+    title = (f" ◆ AGENT TRACKER   {len(rows)} agents · {live} working · {needs} need you · {len(clash)} conflicts · "
+             f"{fmt_n(sum(a['tokens'] for a in rows))} tokens · ${sum(a['cost'] for a in rows):.2f}")
     clock = f"{datetime.now():%H:%M:%S}  ctrl+c to quit "
-    out = [c("1;97;44", title + " " * max(1, w - len(title) - len(clock)) + clock), ""]
-    out.append(c("1;90", f"   {'AGENT':12}{'CLI':7}{'PROJECT':20}{'MODEL':14}{'CONTEXT':13}{'OUT':>6}{'TOTAL':>7}{'AGO':>5}  "
-                         f"{'DOING':{flex}}  NEXT"))
+    out = [c("1;97;41" if needs or clash else "1;97;44", title + " " * max(1, w - len(title) - len(clock)) + clock), ""]
+    out.append(c("1;90", f"   {'AGENT':13}{'CLI':7}{'PROJECT':20}{'MODEL':14}{'CONTEXT':13}{'TOTAL':>7}{'COST':>8}{'ERR':>4}"
+                         f"{'AGO':>5}  {'DOING':{flex}}  NEXT"))
+    icons = {"needs": c("1;91", "⚠"), "working": c("1;92", "●"), "done": c("36", "✓"), "idle": c("90", "○")}
     for a in rows:
-        on = now - a["mtime"] < ACTIVE_SECS
+        kind, detail = st[a["path"]]
+        on = kind in ("needs", "working")
         doing, nxt = doing_next(a)
         proj_name = os.path.basename(a["cwd"].rstrip("/\\")) or a["cwd"]
-        name = ("↳ " if a["sub"] else "") + a["id"][:8]
+        name = ("↳ " if a["sub"] else "") + a["id"][:8] + (" ⚡" if a["path"] in clashing else "")
+        n_err, recent = errors(a)
+        err = c("1;91", f"{n_err:>4}") if recent >= 3 else c("33", f"{n_err:>4}") if n_err else c("90", f"{'·':>4}")
         out.append(
-            " " + (c("1;92", "●") if on else c("90", "○")) + " "
-            + c("1;97" if on else "37", f"{name:12}")
+            " " + icons[kind] + " "
+            + c("1;97" if on else "37", f"{name:13}")
             + c(SRC_COLOR.get(a["src"], "37"), f"{a['src']:7}")
             + c(PALETTE[sum(map(ord, proj_name)) % len(PALETTE)], f"{clip(proj_name, 19):20}")
             + c("90", f"{clip(a['model'].replace('claude-', ''), 13):14}")
             + bar(a["ctx"], a["cap"]) + f" {fmt_n(a['ctx']):>5} "
-            + f"{fmt_n(a['out']):>6}" + c("1", f"{fmt_n(a['tokens']):>7}")
+            + c("1", f"{fmt_n(a['tokens']):>7}") + f"{fmt_cost(a):>8}" + err
             + c("92" if on else "90", f"{ago(now - a['mtime']):>5}") + "  "
-            + action(doing, flex, dim=not on) + "  " + c("95", "→ " + clip(nxt, flex - 2) if nxt else ""))
+            + (c("1;91", clip(detail, flex).ljust(flex)) if kind == "needs" else action(doing, flex, dim=not on))
+            + "  " + c("95", "→ " + clip(nxt, flex - 2) if nxt else ""))
     if not rows:
         out.append(c("90", f"   no agents in the last {hours:g}h" + (f" matching {proj!r}" if proj else "")))
+    for path, ags in sorted(clash.items())[:8]:
+        who = ", ".join(f"{a['id'][:8]} ({ago(now - a['edits'][path])} ago)" for a in ags)
+        out.append(c("1;93", f"   ⚡ {short_path(path)}") + c("90", "  edited by ") + who)
     print("\n".join(out))
 
 
@@ -228,17 +374,21 @@ def timeline(prefix, n=40):
     hit = next(((p, s, f) for p, s, f in files() if os.path.basename(p)[:-6][-36:].startswith(prefix)), None)
     if not hit:
         sys.exit(f"no agent matching {prefix!r}")
-    a = parse(*hit)
-    on = time.time() - a["mtime"] < ACTIVE_SECS
+    a, now = parse(*hit), time.time()
+    kind, detail = status(a, now)
+    n_err, _ = errors(a)
     print(c("1;97;44", f" ◆ {a['id']} ") + "  " + c(SRC_COLOR.get(a["src"], "37"), a["src"]) + "  " + c("1", a["title"] or "(untitled)"))
+    state = {"needs": c("1;91", "⚠ needs you: " + detail), "working": c("1;92", "● working"),
+             "done": c("36", "✓ done " + ago(now - a["mtime"])), "idle": c("90", "○ idle " + ago(now - a["mtime"]))}[kind]
     print(f"   {c('36', a['cwd'])}  {c('90', a['model'])}  context {bar(a['ctx'], a['cap'])} {fmt_n(a['ctx'])}  "
-          f"total {c('1', fmt_n(a['tokens']))}  {c('1;92', '● active') if on else c('90', '○ idle ' + ago(time.time() - a['mtime']))}\n")
-    for ts, ev in a["events"][-n:]:
+          f"total {c('1', fmt_n(a['tokens']))}  {fmt_cost(a)}  {c('91', str(n_err) + ' errors') if n_err else ''}  {state}\n")
+    for ts, ev, ok, _ in a["events"][-n:]:
         try:
             ts = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%m-%d %H:%M:%S")
         except ValueError:
             pass
-        print(f"   {c('90', ts)}  {action(ev, 110)}")
+        mark = c("91", "✗") if ok is False else c("33", "…") if ok is None else c("90", "·")
+        print(f"   {c('90', ts)} {mark} {action(ev, 110)}")
     if a["todos"]:
         print(c("1", "\n   TODOS"))
         for t in a["todos"]:
