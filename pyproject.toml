@@ -1,7 +1,7 @@
 [project]
 name = "agent-tracker"
 version = "0.1.0"
-description = "Live terminal dashboard for every Claude Code agent: what it's doing, tokens, project, and what's next"
+description = "Live dashboard for every coding agent (Claude Code, Codex, Copilot) in terminal or VS Code: what each is doing, context window, who needs you, file conflicts"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"

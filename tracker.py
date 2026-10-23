@@ -1,4 +1,4 @@
-"""Agent tracker: live view of every coding agent (Claude Code, Codex, ...) read from their local transcripts.
+"""Agent tracker: live view of every coding agent (Claude Code, Codex, Copilot) in CLI, VS Code or desktop, from local transcripts.
 
   agents                 # live table of agents active in last 24h, refreshes every 2s
   agents --once          # print once and exit
@@ -7,14 +7,17 @@
   agents --hours 2       # change the time window
   agents 5aeb0dda        # timeline for one agent (session id prefix)
   agents --kill 5aeb0dda # close a running Claude Code agent (asks first)
+  agents --json          # one JSON snapshot; add --stream for one line per refresh (used by the VS Code extension)
 """
 import argparse, glob, json, os, re, signal, subprocess, sys, time
-from datetime import datetime
+import urllib.parse, urllib.request
+from datetime import datetime, timezone
 
 ACTIVE_SECS = 90  # transcript written within this window = agent is working
 STUCK_SECS = 20  # a quick tool (Edit, Read...) unanswered this long = waiting on a permission prompt
 SLOW_STUCK_SECS = 90  # same for tools that can legitimately run long (shell, subagents, web)
-SLOW_TOOLS = {"Bash", "PowerShell", "Agent", "Task", "WebFetch", "WebSearch", "Monitor", "shell", "shell_command"}
+SLOW_TOOLS = {"Bash", "PowerShell", "Agent", "Task", "WebFetch", "WebSearch", "Monitor", "shell", "shell_command",
+              "run_in_terminal"}
 ASK_TOOLS = {"AskUserQuestion", "ExitPlanMode", "request_user_input"}
 CONFLICT_SECS = 3600  # two agents editing the same file within this window = conflict
 _cache = {}  # path -> (mtime, size, parsed)
@@ -22,51 +25,19 @@ _cache = {}  # path -> (mtime, size, parsed)
 CTX_1M = ("claude-fable", "claude-mythos", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
           "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-5")
 
-# $ per 1M tokens: input, output, cache read (cache writes bill at 1.25x input for 5m, 2x for 1h).
-# Longest matching prefix wins. Override or extend in ~/.agent-tracker/prices.json: {"<model prefix>": [input, output, cache_read]}
-PRICES = {
-    "claude-fable-5-1": (10, 50, 0.25), "claude-mythos-5-1": (10, 50, 0.25),
-    "claude-fable-5": (10, 50, 1.0), "claude-mythos-5": (10, 50, 1.0),
-    "claude-opus-5-5": (4, 20, 0.20), "claude-opus-5": (5, 25, 0.50), "claude-opus-4-8": (5, 25, 0.50),
-    "claude-opus-4-7": (5, 25, 0.50), "claude-opus-4-6": (5, 25, 0.50),
-    "claude-sonnet-5": (2, 10, 0.20), "claude-sonnet-4-6": (3, 15, 0.30),
-    "claude-haiku-5-5": (0.10, 0.50, 0.01), "claude-haiku-4-5": (1, 5, 0.10),
-    "gpt-5": (1.25, 10, 0.125),  # GPT-5 list price, used for every gpt-5.x without its own row
-}
-PRICES_FILE = os.path.expanduser("~/.agent-tracker/prices.json")
-try:
-    with open(PRICES_FILE, encoding="utf-8") as f:
-        PRICES.update({k: tuple(v) for k, v in json.load(f).items() if isinstance(v, list) and len(v) == 3})
-except (OSError, ValueError, AttributeError):
-    pass  # no file / bad JSON → built-in prices
-
 COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 PALETTE = ["36", "35", "33", "32", "34", "96", "95", "93"]
 TOOL_COLOR = {"Bash": "36", "PowerShell": "36", "shell": "36", "shell_command": "36", "Edit": "33", "Write": "33",
               "NotebookEdit": "33", "apply_patch": "33", "Read": "34", "Grep": "34", "Glob": "34", "Agent": "35",
-              "Task": "35", "WebFetch": "32", "WebSearch": "32", "web_search": "32"}
-SRC_COLOR = {"claude": "38;5;209", "codex": "38;5;75"}
+              "Task": "35", "WebFetch": "32", "WebSearch": "32", "web_search": "32", "run_in_terminal": "36",
+              "copilot_readFile": "34", "copilot_findFiles": "34", "copilot_findTextInFiles": "34", "copilot_listDirectory": "34",
+              "copilot_replaceString": "33", "copilot_multiReplaceString": "33", "copilot_createFile": "33",
+              "copilot_applyPatch": "33", "copilot_insertEdit": "33"}
+SRC_COLOR = {"claude": "38;5;209", "codex": "38;5;75", "copilot": "38;5;141"}
 
 
 def c(code, s):
     return f"\033[{code}m{s}\033[0m" if COLOR else s
-
-
-def price(model):
-    hits = [k for k in PRICES if model.startswith(k)]
-    return PRICES[max(hits, key=len)] if hits else None
-
-
-def claude_cost(u, model):
-    """$ for one API response, priced like Claude Code's own /cost: 5m vs 1h cache writes, fast mode, web search."""
-    p = price(model)
-    if not p:
-        return None
-    inp, cw, cr, out = (u.get(k, 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"))
-    w1h = (u.get("cache_creation") or {}).get("ephemeral_1h_input_tokens", 0)
-    rate = (2 if u.get("speed") == "fast" else 1) * (5 if model.startswith("claude-haiku-5-5") and inp + cw + cr > 100_000 else 1)
-    searches = (u.get("server_tool_use") or {}).get("web_search_requests", 0)
-    return rate * (inp * p[0] + (cw - w1h) * p[0] * 1.25 + w1h * p[0] * 2 + cr * p[2] + out * p[1]) / 1e6 + searches * 0.01
 
 
 def epoch(ts):
@@ -84,9 +55,13 @@ def summarize(name, inp):
         v = inp.get(k)
         if isinstance(v, list):  # codex `shell` passes argv
             v = " ".join(map(str, v))
-        if isinstance(v, str):
+        if isinstance(v, str) and v.strip():
             return f"{name}: {v}"
     return name
+
+
+def agent_id(path):
+    return os.path.splitext(os.path.basename(path))[0][-36:]
 
 
 def jsonl(f):
@@ -116,6 +91,8 @@ def parse_claude(f, a):
     seen = set()
     for d in jsonl(f):
         a["cwd"] = d.get("cwd") or a["cwd"]
+        if isinstance(d.get("entrypoint"), str):  # cli, claude-vscode, claude-desktop, sdk-ts, ...
+            a["where"] = d["entrypoint"].replace("claude-", "")
         t = d.get("type")
         if t == "ai-title":
             a["title"] = d.get("aiTitle", "")
@@ -143,11 +120,6 @@ def parse_claude(f, a):
             a["ctx"] = inp + cw + cr + out
             a["out"] += out
             a["tokens"] += inp + cw + cr + out
-            cost = claude_cost(u, m.get("model") or "")
-            if cost is not None:
-                a["cost"] += cost
-            elif inp + cw + cr + out:
-                a["unpriced"] = True
         a["ended"] = m.get("stop_reason") == "end_turn"
         for b in content if isinstance(content, list) else []:
             if isinstance(b, dict) and b.get("type") == "tool_use":
@@ -173,7 +145,7 @@ def codex_ok(output):
 
 
 def parse_codex(f, a):
-    seen, tot = set(), {}
+    seen = set()
     for d in jsonl(f):
         p = d.get("payload")
         if not isinstance(p, dict):
@@ -181,6 +153,8 @@ def parse_codex(f, a):
         a["cwd"] = p.get("cwd") or a["cwd"]
         if d.get("type") == "turn_context":
             a["model"] = p.get("model") or a["model"]
+        elif d.get("type") == "session_meta":  # source: vscode / cli / exec
+            a["where"] = p["source"] if isinstance(p.get("source"), str) else "vscode" if "vscode" in str(p.get("originator")) else "cli"
         pt, ts = p.get("type"), d.get("timestamp", "")
         if pt == "token_count" and isinstance(p.get("info"), dict):
             tot, last = p["info"].get("total_token_usage") or {}, p["info"].get("last_token_usage") or {}
@@ -216,19 +190,134 @@ def parse_codex(f, a):
             if name == "update_plan" and isinstance(inp.get("plan"), list):
                 a["todos"] = [{"content": s.get("step", ""), "status": s.get("status")} for s in inp["plan"] if isinstance(s, dict)]
             add_event(a, ts, name, inp, p.get("call_id") if pt != "web_search_call" else None)
-    p = price(a["model"])
-    if p and tot:
-        cached = tot.get("cached_input_tokens", 0)
-        a["cost"] = ((tot.get("input_tokens", 0) - cached) * p[0] + cached * p[2] + tot.get("output_tokens", 0) * p[1]) / 1e6
-    elif a["tokens"]:
-        a["unpriced"] = True
 
 
-# add another agent CLI: a name, a glob for its transcripts, and a parser that fills the agent dict
+def vscode_chat(f):
+    """A VS Code chat session: either one JSON doc, or a .jsonl mutation log
+    (kind 0 = snapshot, 1 = set value at path k, 2 = append to array at k after truncating to i, 3 = delete)."""
+    text = f.read()
+    try:
+        d = json.loads(text)
+        return d["v"] if isinstance(d, dict) and d.get("kind") == 0 else d
+    except ValueError:
+        pass
+    s = {}
+    for d in jsonl(text.splitlines()):
+        kind = d.get("kind")
+        if kind == 0:
+            s = d.get("v") or {}
+            continue
+        try:
+            *path, last = d["k"]
+            target = s
+            for key in path:
+                target = target[key]
+            if kind == 1:
+                target[last] = d.get("v")
+            elif kind == 2:
+                arr = target[last]
+                if "i" in d:
+                    del arr[d["i"]:]
+                arr.extend(d.get("v") or [])
+            elif kind == 3:
+                del target[last]
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue  # patch for a part of the session we never saw; skip it
+    return s if isinstance(s, dict) else {}
+
+
+def uri_path(uri):
+    u = urllib.parse.urlparse(uri)
+    # unquote first: url2pathname only recognises "/c:/x" as a drive path, not VS Code's "/c%3A/x"
+    return urllib.request.url2pathname(urllib.parse.unquote(u.path)) if u.scheme == "file" else urllib.parse.unquote(u.path)
+
+
+def workspace_folder(session_path):
+    """workspaceStorage/<hash>/workspace.json names the folder that VS Code window has open."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.dirname(session_path)), "workspace.json"), encoding="utf-8") as f:
+            w = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if w.get("folder"):
+        return uri_path(w["folder"])
+    return os.path.dirname(uri_path(w["workspace"])) if w.get("workspace") else None
+
+
+COPILOT_EDIT_TOOLS = ("replaceString", "multiReplaceString", "createFile", "applyPatch", "insertEdit", "editFile")
+COPILOT_TODO = {"in-progress": "in_progress", "not-started": "pending", "completed": "completed"}
+
+
+def parse_copilot(f, a):
+    s = vscode_chat(f)
+    a["cwd"], a["where"] = workspace_folder(a["path"]) or "(no folder)", "vscode"
+    a["title"] = s.get("customTitle") or ""
+    for r in s.get("requests") or []:
+        if not isinstance(r, dict):
+            continue
+        ms = r.get("timestamp")
+        ts = datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat() if isinstance(ms, (int, float)) else ""
+        a["model"] = str(r.get("modelId") or a["model"]).replace("copilot/", "")
+        if isinstance(r.get("message"), dict):
+            a["prompt"] = r["message"].get("text", a["prompt"])
+        res = r.get("result") or {}
+        md = res.get("metadata") or {}
+        prompt_t, out_t = md.get("promptTokens") or 0, md.get("outputTokens") or 0
+        a["tokens"] += prompt_t + out_t
+        a["out"] += out_t
+        a["ctx"] = prompt_t + out_t or a["ctx"]
+        for x in r.get("response") or []:
+            if not (isinstance(x, dict) and x.get("kind") == "toolInvocationSerialized"):
+                continue
+            tool, msg = x.get("toolId") or "tool", x.get("invocationMessage")
+            uris = (msg.get("uris") or {}) if isinstance(msg, dict) else {}
+            text = msg.get("value", "") if isinstance(msg, dict) else str(msg or "")
+            # "[](file:///c%3A/x/app.py#1-1)" → "app.py"
+            text = re.sub(r"\[([^\]]*)\]\(([^)]*)\)", lambda m: m.group(1) or os.path.basename(uri_path(m.group(2))), text)
+            call_id = x.get("toolCallId") or f"{r.get('requestId')}:{len(a['events'])}"
+            tsd = x.get("toolSpecificData") or {}
+            term = tsd.get("terminalCommandState") or {} if tsd.get("kind") == "terminal" else {}
+            if tsd.get("kind") == "terminal":
+                text = (tsd.get("commandLine") or {}).get("original") or text
+            when = term.get("timestamp")
+            add_event(a, datetime.fromtimestamp(when / 1000, timezone.utc).isoformat() if isinstance(when, (int, float)) else ts,
+                      tool, {"command": text}, call_id)
+            if x.get("isComplete"):
+                finish_event(a, call_id, term.get("exitCode") in (None, 0))
+            if tool.endswith(COPILOT_EDIT_TOOLS):
+                for u in uris.values():
+                    if isinstance(u, dict) and u.get("scheme") == "file" and u.get("path"):
+                        a["edits"][os.path.normcase(os.path.normpath(urllib.request.url2pathname(u["path"])))] = epoch(ts)
+            todos = tsd.get("todoList")
+            if isinstance(todos, list):
+                a["todos"] = [{"content": t.get("title", ""), "status": COPILOT_TODO.get(t.get("status"))}
+                              for t in todos if isinstance(t, dict)]
+        if isinstance(res.get("errorDetails"), dict):
+            add_event(a, ts, "error", {"description": res["errorDetails"].get("message", "")}, None)
+            a["events"][-1][2] = False
+        a["ended"] = bool(res) or (r.get("modelState") or {}).get("value") not in (None, 0)
+        if a["ended"]:
+            a["pending"].clear()  # a finished request can't be waiting on anything (cancelled tools stay incomplete)
+
+
+def vscode_user_dirs():
+    """VS Code's per-user data folder on each OS, for stable, Insiders and VSCodium."""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA", "")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return [os.path.join(glob.escape(base), app, "User") for app in ("Code", "Code - Insiders", "VSCodium")]
+
+
+# add another agent: a name, a glob for its transcripts, and a parser that fills the agent dict.
+# Claude Code and Codex write the same transcripts whether they run in a terminal, VS Code or the desktop app.
 SOURCES = [
     ("claude", "~/.claude/projects/**/*.jsonl", parse_claude),
     ("codex", "~/.codex/sessions/**/rollout-*.jsonl", parse_codex),
-]
+] + [("copilot", os.path.join(d, *sub), parse_copilot) for d in vscode_user_dirs()
+     for sub in (("workspaceStorage", "*", "chatSessions", "*.json*"), ("globalStorage", "emptyWindowChatSessions", "*.json*"))]
 
 
 def parse(path, src, parser):
@@ -237,8 +326,8 @@ def parse(path, src, parser):
     if hit and hit[:2] == (st.st_mtime, st.st_size):
         return hit[2]
     # ponytail: re-reads the whole file when it changes; tail-only incremental read if transcripts get huge
-    a = dict(path=path, src=src, id=os.path.basename(path)[:-6][-36:], cwd="?", title="", model="", tokens=0,
-             ctx=0, cap=200_000, out=0, cost=0.0, unpriced=False, events=[], pending={}, edits={}, todos=[],
+    a = dict(path=path, src=src, id=agent_id(path), where="cli", cwd="?", title="", model="", tokens=0,
+             ctx=0, cap=200_000, out=0, events=[], pending={}, edits={}, todos=[],
              prompt="", ended=False, mtime=st.st_mtime, sub="subagents" in path)
     with open(path, encoding="utf-8", errors="ignore") as f:
         parser(f, a)
@@ -317,7 +406,7 @@ def close(pid):
 
 
 def kill_agent(prefix, yes):
-    hits = [h for h in files() if os.path.basename(h[0])[:-6][-36:].startswith(prefix)]
+    hits = [h for h in files() if agent_id(h[0]).startswith(prefix)]
     if len(hits) != 1:
         sys.exit(f"{len(hits)} agents match {prefix!r}; give a longer id prefix" if hits else f"no agent matching {prefix!r}")
     a = parse(*hits[0])
@@ -330,7 +419,7 @@ def kill_agent(prefix, yes):
         sys.exit(f"{a['id'][:8]} isn't running (no live Claude Code process for this session)")
     kind, detail = status(a, time.time())
     print(f"{c('1', a['id'][:8])}  {project(a)}  pid {pid}  {a['title']}\n"
-          f"  {kind}: {clip(detail or doing_next(a)[0], 100)}\n  {fmt_n(a['tokens'])} tokens · {fmt_cost(a)}")
+          f"  {kind}: {clip(detail or doing_next(a)[0], 100)}\n  {fmt_n(a['tokens'])} tokens")
     if not yes and input("Close this agent? Unsaved work in progress stops mid-step. [y/N] ").strip().lower() != "y":
         return print("cancelled")
     if running().get(a["id"]) != pid:  # re-check right before killing
@@ -383,7 +472,7 @@ def agents(hours, proj):
             a = parse(p, src, parser)
         except OSError:
             continue  # file rotated/deleted mid-scan
-        if proj.lower() in a["cwd"].lower():
+        if proj.lower() in a["cwd"].lower() and (a["events"] or a["tokens"] or a["prompt"]):  # skip never-used chats
             out.append(a)
     return sorted(out, key=lambda a: -a["mtime"])
 
@@ -397,12 +486,6 @@ def doing_next(a):
 
 def fmt_n(n):
     return f"{n/1e6:.1f}M" if n >= 1e6 else f"{n/1e3:.0f}k" if n >= 1e3 else str(n)
-
-
-def fmt_cost(a):
-    if a["unpriced"] and not a["cost"]:
-        return "–"
-    return f"${a['cost']:.2f}" if a["cost"] < 100 else f"${a['cost']:.0f}"
 
 
 def ago(secs):
@@ -434,22 +517,45 @@ def action(s, n, dim=False):
     return c("90", s) if dim else s
 
 
-def table(hours, proj):
+def snapshot(hours, proj):
     rows, now = agents(hours, proj), time.time()
     st = {a["path"]: status(a, now) for a in rows}
     rows.sort(key=lambda a: st[a["path"]][0] != "needs")  # stable: blocked agents first, then most recent
-    clash = conflicts(rows, now)
+    return rows, st, conflicts(rows, now), running(), now
+
+
+def as_json(hours, proj):
+    rows, st, clash, pids, now = snapshot(hours, proj)
     clashing = {a["path"] for ags in clash.values() for a in ags}
-    pids = running()
+    out = []
+    for a in rows:
+        doing, nxt = doing_next(a)
+        n_err, recent = errors(a)
+        out.append(dict(
+            id=a["id"], src=a["src"], where=a["where"], sub=a["sub"], project=project(a), cwd=a["cwd"], title=a["title"],
+            model=a["model"], status=st[a["path"]][0], detail=clip(st[a["path"]][1], 300), doing=clip(doing, 300),
+            next=clip(nxt, 300), prompt=clip(a["prompt"], 500),
+            ctx=a["ctx"], cap=a["cap"], tokens=a["tokens"], out=a["out"],
+            errors=n_err, recent_errors=recent,
+            idle_secs=int(now - a["mtime"]), pid=pids.get(a["id"]), conflict=a["path"] in clashing,
+            events=[dict(ts=ts, action=clip(ev, 300), ok=ok) for ts, ev, ok, _ in a["events"][-30:]],
+            todos=[dict(content=clip(t.get("content", ""), 300), status=t.get("status")) for t in a["todos"]]))
+    print(json.dumps({"agents": out, "conflicts": [{"path": p, "agents": [a["id"] for a in ags]} for p, ags in clash.items()]}),
+          flush=True)
+
+
+def table(hours, proj):
+    rows, st, clash, pids, now = snapshot(hours, proj)
+    clashing = {a["path"] for ags in clash.values() for a in ags}
     w = os.get_terminal_size().columns if sys.stdout.isatty() else 200
     flex = max(20, (w - 107) // 2)
     live = sum(s[0] == "working" for s in st.values())
     needs = sum(s[0] == "needs" for s in st.values())
     title = (f" ◆ AGENT TRACKER   {len(rows)} agents · {live} working · {needs} need you · {len(clash)} conflicts · "
-             f"{fmt_n(sum(a['tokens'] for a in rows))} tokens · ${sum(a['cost'] for a in rows):.2f}")
+             f"{fmt_n(sum(a['tokens'] for a in rows))} tokens")
     clock = f"{datetime.now():%H:%M:%S}  ctrl+c to quit "
     out = [c("1;97;41" if needs or clash else "1;97;44", title + " " * max(1, w - len(title) - len(clock)) + clock), ""]
-    out.append(c("1;90", f"   {'AGENT':13}{'CLI':7}{'PROJECT':20}{'MODEL':14}{'CONTEXT':13}{'TOTAL':>7}{'COST':>8}{'ERR':>4}"
+    out.append(c("1;90", f"   {'AGENT':13}{'WHERE':15}{'PROJECT':20}{'MODEL':14}{'CONTEXT':13}{'TOTAL':>7}{'ERR':>4}"
                          f"{'AGO':>5}{'PID':>7}  {'DOING':{flex}}  NEXT"))
     icons = {"needs": c("1;91", "⚠"), "working": c("1;92", "●"), "done": c("36", "✓"), "idle": c("90", "○")}
     for a in rows:
@@ -463,11 +569,11 @@ def table(hours, proj):
         out.append(
             " " + icons[kind] + " "
             + c("1;97" if on else "37", f"{name:13}")
-            + c(SRC_COLOR.get(a["src"], "37"), f"{a['src']:7}")
+            + c(SRC_COLOR.get(a["src"], "37"), f"{a['src']:8}") + c("90", f"{clip(a['where'], 6):7}")
             + c(PALETTE[sum(map(ord, proj_name)) % len(PALETTE)], f"{clip(proj_name, 19):20}")
             + c("90", f"{clip(a['model'].replace('claude-', ''), 13):14}")
             + bar(a["ctx"], a["cap"]) + f" {fmt_n(a['ctx']):>5} "
-            + c("1", f"{fmt_n(a['tokens']):>7}") + f"{fmt_cost(a):>8}" + err
+            + c("1", f"{fmt_n(a['tokens']):>7}") + err
             + c("92" if on else "90", f"{ago(now - a['mtime']):>5}")
             + (c("37", f"{pids[a['id']]:>7}") if a["id"] in pids else c("90", f"{'·':>7}")) + "  "
             + (c("1;91", clip(detail, flex).ljust(flex)) if kind == "needs" else action(doing, flex, dim=not on))
@@ -529,7 +635,7 @@ def notify(title, body):
 
 
 def timeline(prefix, n=40):
-    hit = next(((p, s, f) for p, s, f in files() if os.path.basename(p)[:-6][-36:].startswith(prefix)), None)
+    hit = next(((p, s, f) for p, s, f in files() if agent_id(p).startswith(prefix)), None)
     if not hit:
         sys.exit(f"no agent matching {prefix!r}")
     a, now = parse(*hit), time.time()
@@ -540,7 +646,7 @@ def timeline(prefix, n=40):
     state = {"needs": c("1;91", "⚠ needs you: " + detail), "working": c("1;92", "● working"),
              "done": c("36", "✓ done " + ago(now - a["mtime"])), "idle": c("90", "○ idle " + ago(now - a["mtime"]))}[kind]
     print(f"   {c('36', a['cwd'])}  {c('90', a['model'])}  context {bar(a['ctx'], a['cap'])} {fmt_n(a['ctx'])}  "
-          f"total {c('1', fmt_n(a['tokens']))}  {fmt_cost(a)}  {c('91', str(n_err) + ' errors') if n_err else ''}  {state}"
+          f"total {c('1', fmt_n(a['tokens']))}  {c('91', str(n_err) + ' errors') if n_err else ''}  {state}"
           f"{'  pid ' + str(pid) if pid else ''}\n")
     for ts, ev, ok, _ in a["events"][-n:]:
         try:
@@ -569,6 +675,8 @@ def main():
     ap.add_argument("--test-notify", action="store_true", help="send a test notification and exit")
     ap.add_argument("--kill", metavar="ID", help="close a running Claude Code agent (asks first)")
     ap.add_argument("-y", "--yes", action="store_true", help="with --kill: don't ask for confirmation")
+    ap.add_argument("--json", action="store_true", help="print one JSON snapshot and exit")
+    ap.add_argument("--stream", action="store_true", help="with --json: print a snapshot line every -n seconds (parse cache stays warm)")
     args = ap.parse_args()
     if args.test_notify:
         return notify("⚠ agent-tracker: test", "Notifications work. You'll get one like this when an agent needs you.")
@@ -576,7 +684,13 @@ def main():
         args.project = os.getcwd()
     sys.stdout.reconfigure(encoding="utf-8")
     os.system("")  # enables ANSI escapes on Windows consoles
-    if args.kill:
+    if args.json:
+        while True:
+            as_json(args.hours, args.project)
+            if not args.stream:
+                break
+            time.sleep(args.n)
+    elif args.kill:
         kill_agent(args.kill, args.yes)
     elif args.agent:
         timeline(args.agent)

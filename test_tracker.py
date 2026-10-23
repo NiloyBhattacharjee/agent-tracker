@@ -1,4 +1,4 @@
-import json, os, shutil, subprocess, sys, tempfile
+import json, os, pathlib, shutil, subprocess, sys, tempfile
 import tracker
 
 
@@ -19,7 +19,7 @@ def result(i, err=False):
     return {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": f"t{i}", "is_error": err}]}}
 
 
-# claude: same message split over two records counts tokens (and cost) once
+# claude: same message split over two records counts tokens once
 u = {"input_tokens": 10, "cache_read_input_tokens": 90, "output_tokens": 5}
 a = run([
     {"type": "assistant", "cwd": "/x/proj", "message": {"id": "m1", "model": "claude-opus-5-5", "usage": u,
@@ -30,8 +30,7 @@ a = run([
     result(1), result(2),
     "not json",
 ], tracker.parse_claude)
-assert a["tokens"] == 105 and a["out"] == 5 and a["ctx"] == 105, a
-assert abs(a["cost"] - (10 * 4 + 90 * 0.20 + 5 * 20) / 1e6) < 1e-12, a["cost"]
+assert a["tokens"] == 105 and a["out"] == 5 and a["ctx"] == 105 and a["cap"] == 1_000_000, a
 assert a["events"][-1][1] == "Bash: ls"
 assert tracker.doing_next(a) == ("Doing a", "b")
 assert tracker.status(a, a["mtime"] + 30) == ("working", "")
@@ -59,7 +58,7 @@ clash = tracker.conflicts([b1, b2], now)
 assert list(clash) == [os.path.normcase(os.path.normpath("/x/proj/app.py"))] and len(clash[list(clash)[0]]) == 2
 assert tracker.conflicts([b1, b2], now + 2 * tracker.CONFLICT_SECS) == {}
 
-# codex: cumulative token_count, update_plan → todos, argv shell, exit codes, apply_patch edits, cost
+# codex: cumulative token_count, update_plan → todos, argv shell, exit codes, apply_patch edits
 a = run([
     {"type": "session_meta", "payload": {"id": "s1", "cwd": "/proj"}},
     {"type": "turn_context", "payload": {"cwd": "/proj", "model": "gpt-5.3-codex"}},
@@ -80,18 +79,7 @@ assert (a["model"], a["tokens"], a["out"], a["ctx"], a["cap"]) == ("gpt-5.3-code
 assert tracker.doing_next(a) == ("shell: git status", "write test")
 assert tracker.errors(a) == (1, 1)
 assert list(a["edits"]) == [os.path.normcase(os.path.normpath("/proj/src/app.py"))]
-assert abs(a["cost"] - (400 * 1.25 + 50 * 0.125 + 50 * 10) / 1e6) < 1e-12
 assert tracker.status(a, a["mtime"] + 200)[0] == "done"
-# cost: 1h cache writes bill at 2x input (Claude Code's default), 5m at 1.25x; fast mode doubles; web search $10/1k
-u = {"input_tokens": 1000, "cache_creation_input_tokens": 3000, "cache_read_input_tokens": 0, "output_tokens": 0,
-     "cache_creation": {"ephemeral_5m_input_tokens": 1000, "ephemeral_1h_input_tokens": 2000}}
-assert abs(tracker.claude_cost(u, "claude-opus-5-5") - (1000 * 4 + 1000 * 5 + 2000 * 8) / 1e6) < 1e-12
-assert abs(tracker.claude_cost(dict(u, speed="fast"), "claude-opus-5-5") - 2 * (1000 * 4 + 1000 * 5 + 2000 * 8) / 1e6) < 1e-12
-assert abs(tracker.claude_cost({"server_tool_use": {"web_search_requests": 3}}, "claude-sonnet-5-5") - 0.03) < 1e-12
-assert tracker.claude_cost(u, "some-unknown-model") is None
-big = {"input_tokens": 150_000, "output_tokens": 1000}
-assert abs(tracker.claude_cost(big, "claude-haiku-5-5") - (150_000 * 0.5 + 1000 * 2.5) / 1e6) < 1e-12
-
 # alerts fire only on transitions: into needs, working → done, new conflicts
 x = run([call(1, "Edit", {"file_path": "/x/proj/app.py"})], tracker.parse_claude)
 y = run([call(1, "Write", {"file_path": "/x/proj/app.py"})], tracker.parse_claude)
@@ -101,22 +89,56 @@ got = tracker.alerts([x, y], st, clash, {x["path"]: ("working", ""), y["path"]: 
 assert [t for t, _ in got] == ["⚠ proj: agent needs you", "✓ proj: agent finished", "⚡ File conflict"], got
 assert tracker.alerts([x, y], st, clash, st, clash) == []  # nothing changed → no alerts
 
-# closing: a dummy process stands in for a Claude Code session (Windows: identity is checked via procStart)
+# copilot: replay the .jsonl mutation log, folder from workspace.json, terminal exit codes, todo list
+ws = tempfile.mkdtemp()
+os.makedirs(os.path.join(ws, "h", "chatSessions"))
+proj_dir = os.path.join(ws, "my proj")
+with open(os.path.join(ws, "h", "workspace.json"), "w") as f:
+    json.dump({"folder": pathlib.Path(proj_dir).as_uri()}, f)
+session = os.path.join(ws, "h", "chatSessions", "aaaaaaaa-1111-2222-3333-444444444444.jsonl")
+term = lambda cmd, code: {"kind": "toolInvocationSerialized", "toolId": "run_in_terminal", "toolCallId": cmd, "isComplete": True,
+                          "toolSpecificData": {"kind": "terminal", "commandLine": {"original": cmd}, "terminalCommandState": {"exitCode": code}}}
+todo = {"kind": "toolInvocationSerialized", "toolId": "manage_todo_list", "toolCallId": "td", "isComplete": True, "invocationMessage": "",
+        "toolSpecificData": {"kind": "todoList", "todoList": [{"title": "fix", "status": "completed"}, {"title": "test", "status": "not-started"}]}}
+with open(session, "w") as f:
+    for line in [{"kind": 0, "v": {"customTitle": "T", "requests": []}},
+                 {"kind": 2, "k": ["requests"], "v": [{"requestId": "r1", "timestamp": 1792000000000, "modelId": "copilot/claude-opus-4.5", "message": {"text": "fix it"}, "response": []}]},
+                 {"kind": 2, "k": ["requests", 0, "response"], "v": [term("npm test", 1), {"kind": "thinking"}]},
+                 {"kind": 2, "k": ["requests", 0, "response"], "i": 1, "v": [todo, term("npm test -- --fix", 0)]},  # i=1 truncates the thinking item
+                 {"kind": 1, "k": ["requests", 0, "result"], "v": {"metadata": {"promptTokens": 100, "outputTokens": 10}}}]:
+        f.write(json.dumps(line) + "\n")
+a = tracker.parse(session, "copilot", tracker.parse_copilot)
+assert (a["cwd"], a["title"], a["model"], a["tokens"], a["where"]) == (proj_dir, "T", "claude-opus-4.5", 110, "vscode"), a
+assert [e[1] for e in a["events"]] == ["run_in_terminal: npm test", "manage_todo_list", "run_in_terminal: npm test -- --fix"]
+assert tracker.errors(a) == (1, 1) and a["ended"]
+assert tracker.doing_next(a) == ("run_in_terminal: npm test -- --fix", "test")
 if sys.platform == "win32":
-    sid = "11111111-2222-3333-4444-555555555555"
-    tmp = tempfile.mkdtemp()
+    assert tracker.uri_path("file:///c%3A/Users/x%20y") == "c:\\Users\\x y"  # VS Code's encoded drive colon
+shutil.rmtree(ws)
+
+# closing: a dummy process stands in for a Claude Code session.
+# Windows checks identity via procStart; POSIX checks the binary name, so the dummy is `sleep` copied to "claude".
+sid = "11111111-2222-3333-4444-555555555555"
+tmp = tempfile.mkdtemp()
+if sys.platform == "win32":
     dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-    tracker.SESSIONS_DIR = tmp
+    start = tracker.win_proc_start(dummy.pid)
     with open(os.path.join(tmp, f"{dummy.pid}.json"), "w") as f:
         json.dump({"pid": dummy.pid, "sessionId": sid, "procStart": "1"}, f)
+else:
+    fake = os.path.join(tmp, "claude")
+    shutil.copy(shutil.which("sleep"), fake)
+    dummy, start = subprocess.Popen([fake, "60"]), None
+tracker.SESSIONS_DIR = tmp
+if sys.platform == "win32":
     assert tracker.running() == {}, "wrong procStart must not match (PID reuse guard)"
-    with open(os.path.join(tmp, f"{dummy.pid}.json"), "w") as f:
-        json.dump({"pid": dummy.pid, "sessionId": sid, "procStart": tracker.win_proc_start(dummy.pid)}, f)
-    assert tracker.running() == {sid: dummy.pid}
-    with open(os.path.join(tmp, f"{sid}.jsonl"), "w") as f:
-        f.write(json.dumps(call(1, "Bash", {"command": "sleep"})))
-    tracker.SOURCES = [("claude", os.path.join(tmp, "*.jsonl"), tracker.parse_claude)]
-    tracker.kill_agent(sid[:8], yes=True)
-    assert dummy.wait(timeout=10) is not None and tracker.running() == {}
-    shutil.rmtree(tmp)
+with open(os.path.join(tmp, f"{dummy.pid}.json"), "w") as f:
+    json.dump({"pid": dummy.pid, "sessionId": sid, "procStart": start}, f)
+assert tracker.running() == {sid: dummy.pid}
+with open(os.path.join(tmp, f"{sid}.jsonl"), "w") as f:
+    f.write(json.dumps(call(1, "Bash", {"command": "sleep"})))
+tracker.SOURCES = [("claude", os.path.join(tmp, "*.jsonl"), tracker.parse_claude)]
+tracker.kill_agent(sid[:8], yes=True)
+assert dummy.wait(timeout=10) is not None and tracker.running() == {}
+shutil.rmtree(tmp)
 print("ok")

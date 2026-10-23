@@ -3,3 +3,7 @@ __pycache__/
 build/
 dist/
 .venv/
+# copied in by vscode:prepublish / test.js
+vscode-extension/tracker.py
+vscode-extension/LICENSE
+*.vsix

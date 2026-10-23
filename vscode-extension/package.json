@@ -1,0 +1,57 @@
+{
+  "name": "agent-tracker",
+  "displayName": "Agent Tracker",
+  "description": "See every coding agent (Claude Code, Codex, Copilot) across all your projects: what it's doing, its context window, which ones need you, and file conflicts.",
+  "version": "0.1.0",
+  "publisher": "NiloyBhattacharjee",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/NiloyBhattacharjee/agent-tracker" },
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "keywords": ["claude", "codex", "copilot", "agents", "monitor"],
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [{ "id": "agentTracker", "title": "Agent Tracker", "icon": "media/icon.svg" }]
+    },
+    "views": {
+      "agentTracker": [{ "id": "agentTracker.agents", "name": "Agents" }]
+    },
+    "commands": [
+      { "command": "agentTracker.refresh", "title": "Refresh", "icon": "$(refresh)", "category": "Agent Tracker" },
+      { "command": "agentTracker.toggleWorkspace", "title": "Toggle Only This Workspace", "icon": "$(filter)", "category": "Agent Tracker" },
+      { "command": "agentTracker.dashboard", "title": "Open Terminal Dashboard", "icon": "$(terminal)", "category": "Agent Tracker" },
+      { "command": "agentTracker.timeline", "title": "Show Timeline", "icon": "$(history)", "category": "Agent Tracker" },
+      { "command": "agentTracker.kill", "title": "Close Agent", "icon": "$(close)", "category": "Agent Tracker" }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "agentTracker.toggleWorkspace", "when": "view == agentTracker.agents", "group": "navigation@1" },
+        { "command": "agentTracker.dashboard", "when": "view == agentTracker.agents", "group": "navigation@2" },
+        { "command": "agentTracker.refresh", "when": "view == agentTracker.agents", "group": "navigation@3" }
+      ],
+      "view/item/context": [
+        { "command": "agentTracker.timeline", "when": "view == agentTracker.agents && viewItem =~ /^agent/", "group": "inline@1" },
+        { "command": "agentTracker.kill", "when": "view == agentTracker.agents && viewItem == agent-running", "group": "inline@2" }
+      ],
+      "commandPalette": [
+        { "command": "agentTracker.timeline", "when": "false" },
+        { "command": "agentTracker.kill", "when": "false" }
+      ]
+    },
+    "configuration": {
+      "title": "Agent Tracker",
+      "properties": {
+        "agentTracker.pythonPath": { "type": "string", "default": "", "description": "Python 3.9+ used to run the tracker. Empty: try python3, python, then py." },
+        "agentTracker.refreshSeconds": { "type": "number", "default": 3, "minimum": 1, "description": "How often to refresh." },
+        "agentTracker.hours": { "type": "number", "default": 24, "minimum": 1, "description": "Show agents active within this many hours." },
+        "agentTracker.onlyThisWorkspace": { "type": "boolean", "default": false, "description": "Only show agents working in this window's first folder." },
+        "agentTracker.notifications": { "type": "boolean", "default": true, "description": "Notify when an agent needs you, finishes, or a file conflict appears." }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "node -e \"for (const f of ['tracker.py', 'LICENSE']) require('fs').copyFileSync('../' + f, f)\""
+  }
+}
