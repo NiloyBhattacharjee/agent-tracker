@@ -20,6 +20,8 @@ SLOW_TOOLS = {"Bash", "PowerShell", "Agent", "Task", "WebFetch", "WebSearch", "M
               "run_in_terminal"}
 ASK_TOOLS = {"AskUserQuestion", "ExitPlanMode", "request_user_input"}
 CONFLICT_SECS = 3600  # two agents editing the same file within this window = conflict
+CTX_WARN = .8  # Claude Code auto-compacts at window − 33k: ~83% of 200k, ~97% of 1M
+LIMIT_WARN = 80  # Codex plan usage % that triggers a notification
 _cache = {}  # path -> (mtime, size, parsed)
 # models with a 1M context window; everything else (and Codex, which reports its own) uses 200k
 CTX_1M = ("claude-fable", "claude-mythos", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
@@ -98,6 +100,8 @@ def parse_claude(f, a):
             a["title"] = d.get("aiTitle", "")
         elif t == "last-prompt" and d.get("lastPrompt"):
             a["prompt"] = d["lastPrompt"]
+        elif t == "system" and d.get("subtype") == "compact_boundary":
+            a["compactions"] += 1
         m = d.get("message")
         if not isinstance(m, dict):
             continue
@@ -151,11 +155,15 @@ def parse_codex(f, a):
         if not isinstance(p, dict):
             continue
         a["cwd"] = p.get("cwd") or a["cwd"]
-        if d.get("type") == "turn_context":
+        if d.get("type") == "compacted":
+            a["compactions"] += 1
+        elif d.get("type") == "turn_context":
             a["model"] = p.get("model") or a["model"]
         elif d.get("type") == "session_meta":  # source: vscode / cli / exec
             a["where"] = p["source"] if isinstance(p.get("source"), str) else "vscode" if "vscode" in str(p.get("originator")) else "cli"
         pt, ts = p.get("type"), d.get("timestamp", "")
+        if pt == "token_count" and isinstance(p.get("rate_limits"), dict):
+            a["limits"] = (epoch(ts), p["rate_limits"])
         if pt == "token_count" and isinstance(p.get("info"), dict):
             tot, last = p["info"].get("total_token_usage") or {}, p["info"].get("last_token_usage") or {}
             a["tokens"], a["out"] = tot.get("total_tokens", a["tokens"]), tot.get("output_tokens", a["out"])
@@ -333,7 +341,7 @@ def parse(path, src, parser):
     # ponytail: re-reads the whole file when it changes; tail-only incremental read if transcripts get huge
     a = dict(path=path, src=src, id=agent_id(path), where="cli", cwd="?", title="", model="", tokens=0,
              ctx=0, cap=200_000, out=0, events=[], pending={}, edits={}, todos=[],
-             prompt="", ended=False, mtime=st.st_mtime, sub="subagents" in path)
+             prompt="", ended=False, mtime=st.st_mtime, sub="subagents" in path, compactions=0, limits=None)
     with open(path, encoding="utf-8", errors="ignore") as f:
         parser(f, a)
     if a["model"].startswith(CTX_1M):
@@ -467,7 +475,7 @@ def conflicts(rows, now):
     return {p: ags for p, ags in by_path.items() if len(ags) > 1}
 
 
-def agents(hours, proj):
+def agents(hours):
     cutoff = time.time() - hours * 3600
     out = []
     for p, src, parser in files():
@@ -477,9 +485,32 @@ def agents(hours, proj):
             a = parse(p, src, parser)
         except OSError:
             continue  # file rotated/deleted mid-scan
-        if proj.lower() in a["cwd"].lower() and (a["events"] or a["tokens"] or a["prompt"]):  # skip never-used chats
+        if a["events"] or a["tokens"] or a["prompt"]:  # skip never-used chats
             out.append(a)
     return sorted(out, key=lambda a: -a["mtime"])
+
+
+def codex_limits(rows, now):
+    """→ [(window, used %, resets_at)] from the newest Codex rate-limit snapshot; limits are per account, so any session's will do."""
+    snaps = [a["limits"] for a in rows if a["limits"]]
+    if not snaps:
+        return []
+    ts, rl = max(snaps, key=lambda s: s[0])
+    out = []
+    for k in ("primary", "secondary"):
+        w = rl.get(k)
+        if not isinstance(w, dict) or not w.get("window_minutes"):
+            continue
+        reset = w.get("resets_at") or (ts + w["resets_in_seconds"] if w.get("resets_in_seconds") else None)
+        if reset and reset < now:
+            continue  # that window has rolled over since; the old % no longer applies
+        m = w["window_minutes"]
+        out.append(("week" if m == 10080 else f"{m // 60}h" if m % 60 == 0 else f"{m}m", w.get("used_percent") or 0, reset))
+    return out
+
+
+def full(a):
+    return a["ctx"] >= CTX_WARN * a["cap"]
 
 
 def doing_next(a):
@@ -510,7 +541,11 @@ def short_path(p, parts=3):
 def bar(n, cap, w=6):
     frac = min(1, n / cap)
     fill = round(frac * w)
-    return c("32" if frac < .5 else "33" if frac < .8 else "31", "▰" * fill) + c("90", "▱" * (w - fill))
+    return c("32" if frac < CTX_WARN else "33" if frac < .9 else "31", "▰" * fill) + c("90", "▱" * (w - fill))
+
+
+def resets(ts, now):
+    return "resets " + datetime.fromtimestamp(ts).strftime("%H:%M" if ts - now < 86400 else "%a %H:%M") if ts else ""
 
 
 def action(s, n, dim=False):
@@ -523,14 +558,15 @@ def action(s, n, dim=False):
 
 
 def snapshot(hours, proj):
-    rows, now = agents(hours, proj), time.time()
+    everyone, now = agents(hours), time.time()
+    rows = [a for a in everyone if proj.lower() in a["cwd"].lower()]
     st = {a["path"]: status(a, now) for a in rows}
     rows.sort(key=lambda a: st[a["path"]][0] != "needs")  # stable: blocked agents first, then most recent
-    return rows, st, conflicts(rows, now), running(), now
+    return rows, st, conflicts(rows, now), running(), codex_limits(everyone, now), now
 
 
 def as_json(hours, proj):
-    rows, st, clash, pids, now = snapshot(hours, proj)
+    rows, st, clash, pids, limits, now = snapshot(hours, proj)
     clashing = {a["path"] for ags in clash.values() for a in ags}
     out = []
     for a in rows:
@@ -540,27 +576,32 @@ def as_json(hours, proj):
             id=a["id"], src=a["src"], where=a["where"], sub=a["sub"], project=project(a), cwd=a["cwd"], title=a["title"],
             model=a["model"], status=st[a["path"]][0], detail=clip(st[a["path"]][1], 300), doing=clip(doing, 300),
             next=clip(nxt, 300), prompt=clip(a["prompt"], 500),
-            ctx=a["ctx"], cap=a["cap"], tokens=a["tokens"], out=a["out"],
+            ctx=a["ctx"], cap=a["cap"], tokens=a["tokens"], out=a["out"], compactions=a["compactions"],
             errors=n_err, recent_errors=recent,
             idle_secs=int(now - a["mtime"]), pid=pids.get(a["id"]), conflict=a["path"] in clashing,
             events=[dict(ts=ts, action=clip(ev, 300), ok=ok) for ts, ev, ok, _ in a["events"][-30:]],
             todos=[dict(content=clip(t.get("content", ""), 300), status=t.get("status")) for t in a["todos"]]))
-    print(json.dumps({"agents": out, "conflicts": [{"path": p, "agents": [a["id"] for a in ags]} for p, ags in clash.items()]}),
-          flush=True)
+    print(json.dumps({"agents": out, "conflicts": [{"path": p, "agents": [a["id"] for a in ags]} for p, ags in clash.items()],
+                      "limits": [dict(window=w, used=u, resets_at=r) for w, u, r in limits]}), flush=True)
 
 
 def table(hours, proj):
-    rows, st, clash, pids, now = snapshot(hours, proj)
+    rows, st, clash, pids, limits, now = snapshot(hours, proj)
     clashing = {a["path"] for ags in clash.values() for a in ags}
     w = os.get_terminal_size().columns if sys.stdout.isatty() else 200
-    flex = max(20, (w - 107) // 2)
+    flex = max(20, (w - 110) // 2)
     live = sum(s[0] == "working" for s in st.values())
     needs = sum(s[0] == "needs" for s in st.values())
     title = (f" ◆ AGENT TRACKER   {len(rows)} agents · {live} working · {needs} need you · {len(clash)} conflicts · "
              f"{fmt_n(sum(a['tokens'] for a in rows))} tokens")
     clock = f"{datetime.now():%H:%M:%S}  ctrl+c to quit "
-    out = [c("1;97;41" if needs or clash else "1;97;44", title + " " * max(1, w - len(title) - len(clock)) + clock), ""]
-    out.append(c("1;90", f"   {'AGENT':13}{'WHERE':15}{'PROJECT':20}{'MODEL':14}{'CONTEXT':13}{'TOTAL':>7}{'ERR':>4}"
+    out = [c("1;97;41" if needs or clash else "1;97;44", title + " " * max(1, w - len(title) - len(clock)) + clock)]
+    if limits:
+        out.append(c("90", "   codex plan   ") + c("90", "   ·   ").join(
+            f"{name} {bar(used, 100)} " + c("1;91" if used >= LIMIT_WARN else "1", f"{used:.0f}%") + c("90", f"  {resets(r, now)}")
+            for name, used, r in limits))
+    out.append("")
+    out.append(c("1;90", f"   {'AGENT':13}{'WHERE':15}{'PROJECT':20}{'MODEL':14}{'CONTEXT':16}{'TOTAL':>7}{'ERR':>4}"
                          f"{'AGO':>5}{'PID':>7}  {'DOING':{flex}}  NEXT"))
     icons = {"needs": c("1;91", "⚠"), "working": c("1;92", "●"), "done": c("36", "✓"), "idle": c("90", "○")}
     for a in rows:
@@ -570,6 +611,7 @@ def table(hours, proj):
         proj_name = project(a)
         name =("↳ " if a["sub"] else "") + a["id"][:8] + (" ⚡" if a["path"] in clashing else "")
         n_err, recent = errors(a)
+        compacted = f"⟳{a['compactions']}" if a["compactions"] else ""
         err = c("1;91", f"{n_err:>4}") if recent >= 3 else c("33", f"{n_err:>4}") if n_err else c("90", f"{'·':>4}")
         out.append(
             " " + icons[kind] + " "
@@ -577,7 +619,7 @@ def table(hours, proj):
             + c(SRC_COLOR.get(a["src"], "37"), f"{a['src']:8}") + c("90", f"{clip(a['where'], 6):7}")
             + c(PALETTE[sum(map(ord, proj_name)) % len(PALETTE)], f"{clip(proj_name, 19):20}")
             + c("90", f"{clip(a['model'].replace('claude-', ''), 13):14}")
-            + bar(a["ctx"], a["cap"]) + f" {fmt_n(a['ctx']):>5} "
+            + bar(a["ctx"], a["cap"]) + f" {fmt_n(a['ctx']):>5} " + c("95", f"{compacted:3}")
             + c("1", f"{fmt_n(a['tokens']):>7}") + err
             + c("92" if on else "90", f"{ago(now - a['mtime']):>5}")
             + (c("37", f"{pids[a['id']]:>7}") if a["id"] in pids else c("90", f"{'·':>7}")) + "  "
@@ -589,17 +631,24 @@ def table(hours, proj):
         who = ", ".join(f"{a['id'][:8]} ({ago(now - a['edits'][path])} ago)" for a in ags)
         out.append(c("1;93", f"   ⚡ {short_path(path)}") + c("90", "  edited by ") + who)
     print("\n".join(out))
-    return rows, st, clash
+    return rows, st, clash, limits
 
 
 def project(a):
     return os.path.basename(a["cwd"].rstrip("/\\")) or a["cwd"]
 
 
-def alerts(rows, st, clash, prev_st, prev_clash):
-    """→ [(title, body)] for state changes since the last frame: blocked on you, finished a turn, new file conflict."""
+def alerts(cur, prev):
+    """cur/prev = (rows, st, clash, limits) of this and the last frame → [(title, body)] for what changed in between:
+    blocked on you, finished a turn, context nearly full, new file conflict, Codex plan limit nearly used up."""
+    rows, st, clash, limits = cur
+    prev_rows, prev_st, prev_clash, prev_limits = prev
+    was_full = {a["path"] for a in prev_rows if full(a)}
     out = []
     for a in rows:
+        if full(a) and a["path"] not in was_full:
+            out.append((f"◔ {project(a)}: context {100 * a['ctx'] // a['cap']}% full",
+                        f"{a['id'][:8]}  {fmt_n(a['ctx'])} of {fmt_n(a['cap'])} tokens, it will compact soon"))
         kind, detail = st[a["path"]]
         was = prev_st.get(a["path"], ("",))[0]
         if kind == "needs" and was != "needs":
@@ -608,6 +657,10 @@ def alerts(rows, st, clash, prev_st, prev_clash):
             out.append((f"✓ {project(a)}: agent finished", f"{a['id'][:8]}  {a['title'] or doing_next(a)[0]}"))
     for path in clash.keys() - prev_clash.keys():
         out.append(("⚡ File conflict", f"{short_path(path)} edited by " + ", ".join(a["id"][:8] for a in clash[path])))
+    was_hot = {name for name, used, _ in prev_limits if used >= LIMIT_WARN}
+    for name, used, r in limits:
+        if used >= LIMIT_WARN and name not in was_hot:
+            out.append((f"⏳ Codex {name} limit {used:.0f}% used", resets(r, time.time()) or "nearly used up"))
     return out
 
 
@@ -646,12 +699,13 @@ def timeline(prefix, n=40):
     a, now = parse(*hit), time.time()
     kind, detail = status(a, now)
     n_err, _ = errors(a)
+    compacted = c("95", f"compacted {a['compactions']}×  ") if a["compactions"] else ""
     pid = running().get(a["id"])
     print(c("1;97;44", f" ◆ {a['id']} ") + "  " + c(SRC_COLOR.get(a["src"], "37"), a["src"]) + "  " + c("1", a["title"] or "(untitled)"))
     state = {"needs": c("1;91", "⚠ needs you: " + detail), "working": c("1;92", "● working"),
              "done": c("36", "✓ done " + ago(now - a["mtime"])), "idle": c("90", "○ idle " + ago(now - a["mtime"]))}[kind]
     print(f"   {c('36', a['cwd'])}  {c('90', a['model'])}  context {bar(a['ctx'], a['cap'])} {fmt_n(a['ctx'])}  "
-          f"total {c('1', fmt_n(a['tokens']))}  {c('91', str(n_err) + ' errors') if n_err else ''}  {state}"
+          f"total {c('1', fmt_n(a['tokens']))}  {compacted}{c('91', str(n_err) + ' errors') if n_err else ''}  {state}"
           f"{'  pid ' + str(pid) if pid else ''}\n")
     for ts, ev, ok, _ in a["events"][-n:]:
         try:
@@ -707,11 +761,11 @@ def main():
         try:
             while True:
                 print("\033[H\033[J", end="")
-                rows, st, clash = table(args.hours, args.project)
+                cur = table(args.hours, args.project)
                 if prev and not args.no_notify:
-                    for title, body in alerts(rows, st, clash, *prev):
+                    for title, body in alerts(cur, prev):
                         notify(title, body)
-                prev = st, clash
+                prev = cur
                 time.sleep(args.n)
         except KeyboardInterrupt:
             pass

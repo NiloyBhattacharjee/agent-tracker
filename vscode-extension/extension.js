@@ -15,6 +15,9 @@ const cfg = () => vscode.workspace.getConfiguration('agentTracker');
 const fmtN = n => (n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'k' : String(n));
 const ago = s => (s < 60 ? s + 's' : s < 3600 ? Math.floor(s / 60) + 'm' : s < 172800 ? Math.floor(s / 3600) + 'h' : Math.floor(s / 86400) + 'd');
 const pct = a => Math.min(100, Math.round((100 * a.ctx) / a.cap));
+const full = a => a.ctx >= 0.8 * a.cap; // tracker.py CTX_WARN: Claude Code auto-compacts a 200k window at ~83%
+const LIMIT_WARN = 80;
+const compacted = a => (a.compactions ? ` ⟳${a.compactions}` : '');
 const bar = a => '▰'.repeat(Math.round(pct(a) / 10)) + '▱'.repeat(10 - Math.round(pct(a) / 10));
 const where = a => (a.where === 'cli' ? a.src : `${a.src} ${a.where}`);
 
@@ -45,7 +48,7 @@ function agentItem(a) {
   const s = STATUS[a.status] || STATUS.idle;
   const it = item(a.project, s.icon, s.color, vscode.TreeItemCollapsibleState.Collapsed);
   it.id = a.id; // keeps expansion state across refreshes
-  it.description = `${pct(a)}% · ${a.status === 'needs' ? a.detail : a.doing}`;
+  it.description = `${full(a) ? '◔ ' : ''}${pct(a)}%${compacted(a)} · ${a.status === 'needs' ? a.detail : a.doing}`;
   it.contextValue = a.pid ? 'agent-running' : 'agent';
   // transcript text is untrusted: appendText escapes it, and the tooltip isn't trusted to run command links
   const md = new vscode.MarkdownString('', true);
@@ -54,6 +57,7 @@ function agentItem(a) {
   line(`$(${s.icon}) ${s.label}`, a.detail ? `: ${a.detail}` : '');
   line('', `${where(a)} · ${a.model || '?'} · ${a.id.slice(0, 8)}${a.pid ? ` · pid ${a.pid}` : ''} · last active ${ago(a.idle_secs)} ago`);
   line('', `Context ${bar(a)} ${fmtN(a.ctx)} / ${fmtN(a.cap)} (${pct(a)}%) · ${fmtN(a.tokens)} tokens total`);
+  if (a.compactions) line('', `Compacted ${a.compactions}× (older context was summarized, details may be lost)`);
   if (a.errors) line('', `${a.errors} failed tool calls${a.recent_errors >= 3 ? ', failing repeatedly' : ''}`);
   if (a.conflict) line('$(zap) ', 'edited a file another agent also edited');
   if (a.next) line('Next: ', a.next);
@@ -105,25 +109,38 @@ class AgentTree {
 function updateStatusBar(sb, data) {
   const count = k => data.agents.filter(a => a.status === k).length;
   const [needs, working, conflicts] = [count('needs'), count('working'), data.conflicts.length];
-  sb.text = `$(pulse) ${working}` + (needs ? ` $(warning) ${needs}` : '') + (conflicts ? ` $(zap) ${conflicts}` : '');
-  sb.tooltip = `Agent Tracker: ${data.agents.length} agents · ${working} working · ${needs} need you · ${conflicts} file conflicts`;
-  sb.backgroundColor = needs || conflicts ? new vscode.ThemeColor('statusBarItem.warningBackground') : undefined;
+  const limits = data.limits || [];
+  const hot = limits.some(l => l.used >= LIMIT_WARN);
+  sb.text = `$(pulse) ${working}` + (needs ? ` $(warning) ${needs}` : '') + (conflicts ? ` $(zap) ${conflicts}` : '')
+    + (limits.length ? ` $(dashboard) ${Math.round(Math.max(...limits.map(l => l.used)))}%` : '');
+  sb.tooltip = `Agent Tracker: ${data.agents.length} agents · ${working} working · ${needs} need you · ${conflicts} file conflicts`
+    + limits.map(l => `\nCodex ${l.window} limit: ${Math.round(l.used)}% used${resets(l)}`).join('');
+  sb.backgroundColor = needs || conflicts || hot ? new vscode.ThemeColor('statusBarItem.warningBackground') : undefined;
   sb.show();
 }
 
-// notify on state changes only, mirroring tracker.py's alerts(): needs you, finished a turn, new conflict
+const resets = l => (l.resets_at ? `, resets ${new Date(l.resets_at * 1000).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` : '');
+
+// notify on state changes only, mirroring tracker.py's alerts(): needs you, finished a turn, context nearly full,
+// new conflict, Codex plan limit nearly used up
 function alerts(prev, data) {
   if (!prev || !cfg().get('notifications')) return;
   const was = new Map(prev.agents.map(a => [a.id, a.status]));
+  const wasFull = new Set(prev.agents.filter(full).map(a => a.id));
   const warn = msg => vscode.window.showWarningMessage(msg, 'Show Agents')
     .then(pick => pick && vscode.commands.executeCommand('agentTracker.agents.focus'));
   for (const a of data.agents) {
     if (a.status === 'needs' && was.get(a.id) !== 'needs') warn(`${a.project}: agent needs you (${a.detail})`);
     else if (a.status === 'done' && was.get(a.id) === 'working') vscode.window.showInformationMessage(`${a.project}: agent finished (${a.title || a.doing})`);
+    if (full(a) && !wasFull.has(a.id)) warn(`${a.project}: context ${pct(a)}% full (${fmtN(a.ctx)} of ${fmtN(a.cap)}), it will compact soon`);
   }
   const known = new Set(prev.conflicts.map(c => c.path));
   for (const c of data.conflicts) {
     if (!known.has(c.path)) warn(`File conflict: ${path.basename(c.path)} edited by ${c.agents.map(id => id.slice(0, 8)).join(', ')}`);
+  }
+  const wasHot = new Set((prev.limits || []).filter(l => l.used >= LIMIT_WARN).map(l => l.window));
+  for (const l of data.limits || []) {
+    if (l.used >= LIMIT_WARN && !wasHot.has(l.window)) warn(`Codex ${l.window} limit ${Math.round(l.used)}% used${resets(l)}`);
   }
 }
 

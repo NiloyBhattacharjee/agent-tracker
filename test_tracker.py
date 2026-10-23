@@ -31,6 +31,9 @@ a = run([
     "not json",
 ], tracker.parse_claude)
 assert a["tokens"] == 105 and a["out"] == 5 and a["ctx"] == 105 and a["cap"] == 1_000_000, a
+assert a["compactions"] == 0
+assert run([{"type": "system", "subtype": "compact_boundary", "compactMetadata": {"preTokens": 167000}}] * 2,
+           tracker.parse_claude)["compactions"] == 2
 assert a["events"][-1][1] == "Bash: ls"
 assert tracker.doing_next(a) == ("Doing a", "b")
 assert tracker.status(a, a["mtime"] + 30) == ("working", "")
@@ -73,9 +76,17 @@ a = run([
     {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 450,
      "cached_input_tokens": 50, "output_tokens": 50, "total_tokens": 500}, "last_token_usage": {"total_tokens": 300},
      "model_context_window": 258400}}},
+    {"type": "compacted", "payload": {"message": ""}},
+    {"type": "event_msg", "timestamp": "2026-10-23T10:00:00Z", "payload": {"type": "token_count", "info": None, "rate_limits": {
+     "primary": {"used_percent": 85.0, "window_minutes": 300, "resets_at": 1793000000},
+     "secondary": {"used_percent": 4.0, "window_minutes": 10080, "resets_at": 1761000000}}}},
     {"type": "event_msg", "payload": {"type": "task_complete"}},
 ], tracker.parse_codex)
 assert (a["model"], a["tokens"], a["out"], a["ctx"], a["cap"]) == ("gpt-5.3-codex", 500, 50, 300, 258400), a
+assert a["compactions"] == 1
+# plan limits: newest snapshot wins; the weekly window already reset by `now`, so it's dropped
+assert tracker.codex_limits([a], 1770000000) == [("5h", 85.0, 1793000000)], tracker.codex_limits([a], 1770000000)
+assert tracker.codex_limits([], 0) == []
 assert tracker.doing_next(a) == ("shell: git status", "write test")
 assert tracker.errors(a) == (1, 1)
 assert list(a["edits"]) == [os.path.normcase(os.path.normpath("/proj/src/app.py"))]
@@ -85,9 +96,15 @@ x = run([call(1, "Edit", {"file_path": "/x/proj/app.py"})], tracker.parse_claude
 y = run([call(1, "Write", {"file_path": "/x/proj/app.py"})], tracker.parse_claude)
 st = {x["path"]: ("needs", "approve? Edit: app.py"), y["path"]: ("done", "")}
 clash = {"app.py": [x, y]}
-got = tracker.alerts([x, y], st, clash, {x["path"]: ("working", ""), y["path"]: ("working", "")}, {})
+got = tracker.alerts(([x, y], st, clash, []), ([x, y], {x["path"]: ("working", ""), y["path"]: ("working", "")}, {}, []))
 assert [t for t, _ in got] == ["⚠ proj: agent needs you", "✓ proj: agent finished", "⚡ File conflict"], got
-assert tracker.alerts([x, y], st, clash, st, clash) == []  # nothing changed → no alerts
+assert tracker.alerts(([x, y], st, clash, []), ([x, y], st, clash, [])) == []  # nothing changed → no alerts
+# context crossing 80% and a Codex window crossing 80% alert once
+x_full = dict(x, ctx=170_000, cap=200_000)
+limits = [("5h", 85.0, None)]
+got = tracker.alerts(([x_full], st, {}, limits), ([x], st, {}, [("5h", 60.0, None)]))
+assert [t for t, _ in got] == ["◔ proj: context 85% full", "⏳ Codex 5h limit 85% used"], got
+assert tracker.alerts(([x_full], st, {}, limits), ([x_full], st, {}, limits)) == []
 
 # copilot: replay the .jsonl mutation log, folder from workspace.json, terminal exit codes, todo list
 ws = tempfile.mkdtemp()

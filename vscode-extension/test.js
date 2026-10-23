@@ -59,7 +59,7 @@ const ext = require('./extension');
   }
 
   // notifications fire only on transitions
-  const agent = (id, status) => ({ id, status, project: 'p', detail: 'approve? Bash: rm', title: 'T', doing: 'x' });
+  const agent = (id, status, ctx = 1000) => ({ id, status, project: 'p', detail: 'approve? Bash: rm', title: 'T', doing: 'x', ctx, cap: 200000 });
   shown.length = 0;
   ext.alerts({ agents: [agent('a', 'working'), agent('b', 'working')], conflicts: [] },
     { agents: [agent('a', 'needs'), agent('b', 'done')], conflicts: [{ path: '/x/app.py', agents: ['a', 'b'] }] });
@@ -68,6 +68,13 @@ const ext = require('./extension');
   const same = { agents: [agent('a', 'needs')], conflicts: [] };
   ext.alerts(same, same);
   ext.alerts(null, same); // first snapshot is a baseline
+  assert.strictEqual(shown.length, 0);
+  // context crossing 80% and a Codex window crossing 80% notify once
+  const hot = { agents: [agent('a', 'working', 170000)], conflicts: [], limits: [{ window: '5h', used: 85, resets_at: null }] };
+  ext.alerts({ agents: [agent('a', 'working')], conflicts: [], limits: [{ window: '5h', used: 60, resets_at: null }] }, hot);
+  assert.deepStrictEqual(shown.map(s => s[1].split(' ').slice(0, 3).join(' ')), ['p: context 85%', 'Codex 5h limit'], JSON.stringify(shown));
+  shown.length = 0;
+  ext.alerts(hot, hot);
   assert.strictEqual(shown.length, 0);
 
   ctx.subscriptions.forEach(s => s.dispose && s.dispose());

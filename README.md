@@ -8,7 +8,7 @@ It tracks **Claude Code**, **OpenAI Codex**, and **GitHub Copilot Chat** agents,
 
 ![The agents dashboard: two agents need you, a file conflict, Claude Code, Codex and Copilot agents side by side](docs/dashboard.gif)
 
-It's color-coded. The title bar turns **red** when an agent needs you or files conflict, and blocked agents jump to the top. ERR turns red when an agent is failing over and over. The context bar goes green, then yellow, then red as the window fills.
+It's color-coded. The title bar turns **red** when an agent needs you or files conflict, and blocked agents jump to the top. ERR turns red when an agent is failing over and over. The context bar turns yellow at 80% (Claude Code auto-compacts a 200k window at ~83%) and red at 90%.
 
 ## What it shows
 
@@ -21,13 +21,15 @@ It's color-coded. The title bar turns **red** when an agent needs you or files c
 | WHERE | which agent (`claude`, `codex`, `copilot`) and where it runs (`cli`, `vscode`, `desktop`, `exec`) |
 | PROJECT | the directory the agent is working in |
 | MODEL | model of the latest turn |
-| CONTEXT | how full the context window is right now: 1M for current Claude models, the window Codex reports, 200k otherwise |
+| CONTEXT | how full the context window is right now: 1M for current Claude models, the window Codex reports, 200k otherwise. **⟳2** = it has compacted twice (older context was summarized, so it may have forgotten details) |
 | TOTAL | all tokens processed, including cached input |
 | ERR | failed tool calls (non-zero exit codes, failed edits, rejected calls). **Red** = 3+ of its last 5 calls failed, so it's probably looping |
 | AGO | time since its last action |
 | PID | process id of a live Claude Code agent (`·` = not running, or a tool that doesn't record it). These are the agents you can [close](#closing-agents) |
 | DOING | the task it marked in-progress, else its last tool call. For a blocked agent: the question it asked or the call waiting for approval |
 | NEXT | the next pending item on its todo list / plan |
+
+If you use Codex, a line under the title shows your **Codex plan usage**: the 5-hour and weekly windows, % used, and when each resets (`codex plan   5h ▰▰▰▰▰▱ 83%  resets 23:59 · week ▰▰▱▱▱▱ 41%  resets Tue 09:49`). Codex writes this to its session logs. Claude Code doesn't, so there's no equivalent for Claude (use `/usage` inside Claude Code).
 
 Drill into one agent for a timestamped timeline of every command and file it touched (`✗` = failed, `…` = still pending), plus its full todo list:
 
@@ -93,6 +95,8 @@ While the live dashboard is running, you get a native desktop notification when:
 - **⚠ an agent needs you:** it asked a question or is waiting on a permission prompt
 - **✓ an agent finished its turn** and is waiting for your next prompt
 - **⚡ a new file conflict appears**
+- **◔ an agent's context passes 80%**, so it will compact soon
+- **⏳ a Codex plan window passes 80%** used
 
 Each one says which project and agent, plus the question or the waiting command. Notifications only fire on *changes*, so an agent that stays blocked doesn't spam you. Starting the tracker doesn't replay old states either.
 
