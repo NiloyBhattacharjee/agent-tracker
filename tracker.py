@@ -10,7 +10,7 @@
   agents --json          # one JSON snapshot; add --stream for one line per refresh (used by the VS Code extension)
 """
 import argparse, glob, json, os, re, signal, subprocess, sys, time
-import urllib.parse, urllib.request
+import urllib.parse
 from datetime import datetime, timezone
 
 ACTIVE_SECS = 90  # transcript written within this window = agent is working
@@ -226,10 +226,15 @@ def vscode_chat(f):
     return s if isinstance(s, dict) else {}
 
 
+def local_path(p):
+    """URI path to OS path: "/c%3A/x%20y" becomes c:/x y on Windows, "/home/x" stays. (url2pathname differs across Pythons.)"""
+    p = urllib.parse.unquote(p)
+    return os.path.normpath(p[1:] if re.match(r"/[A-Za-z]:", p) else p)
+
+
 def uri_path(uri):
     u = urllib.parse.urlparse(uri)
-    # unquote first: url2pathname only recognises "/c:/x" as a drive path, not VS Code's "/c%3A/x"
-    return urllib.request.url2pathname(urllib.parse.unquote(u.path)) if u.scheme == "file" else urllib.parse.unquote(u.path)
+    return local_path(u.path) if u.scheme == "file" else urllib.parse.unquote(u.path)
 
 
 def workspace_folder(session_path):
@@ -287,7 +292,7 @@ def parse_copilot(f, a):
             if tool.endswith(COPILOT_EDIT_TOOLS):
                 for u in uris.values():
                     if isinstance(u, dict) and u.get("scheme") == "file" and u.get("path"):
-                        a["edits"][os.path.normcase(os.path.normpath(urllib.request.url2pathname(u["path"])))] = epoch(ts)
+                        a["edits"][os.path.normcase(local_path(u["path"]))] = epoch(ts)
             todos = tsd.get("todoList")
             if isinstance(todos, list):
                 a["todos"] = [{"content": t.get("title", ""), "status": COPILOT_TODO.get(t.get("status"))}
