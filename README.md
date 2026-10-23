@@ -1,4 +1,6 @@
-# agent-tracker
+<p align="center"><img src="vscode-extension/media/logo.svg" width="140" alt="AT logo: a terminal window with the letters AT"></p>
+
+<h1 align="center">agent-tracker</h1>
 
 **A live dashboard for all your coding agents, in the terminal or in VS Code.** Run 15 agents across 15 projects and see, in one screen, what each one is doing right now, which ones are **blocked waiting on you**, which ones are **editing the same file**, which ones are **failing in a loop**, and how full each one's **context window** is. Close an agent from the dashboard when it goes off the rails.
 
@@ -65,7 +67,9 @@ The same tracker as a VS Code sidebar, under [`vscode-extension/`](vscode-extens
 - **✕** on a row closes that agent (asks first); the **history** button opens its timeline; the **terminal** button opens the full live table
 - a filter button for **only this workspace's agents**
 
-To build and install it (needs Node.js):
+Install it from the VS Code Marketplace (search **Agent Tracker**) once published, or download the `.vsix` from the [latest release](https://github.com/NiloyBhattacharjee/agent-tracker/releases/latest) and run `code --install-extension agent-tracker-*.vsix`.
+
+To build it yourself (needs Node.js):
 
 ```bash
 cd vscode-extension
@@ -177,6 +181,21 @@ Every source is one entry in `SOURCES` in `tracker.py`: a name, a glob for its t
 - **NEXT** is only filled when the agent keeps a todo list (Claude Code's `TodoWrite`, Codex's `update_plan`, Copilot's todo tool). Agents that don't plan show only DOING.
 - Copilot's chat-session format is VS Code-internal and may change between VS Code releases.
 - "Processes" here means the commands each agent runs, read from its transcript. Apart from the PID check for closing agents, there's no OS process inspection.
+
+## Releasing
+
+Push a version tag and the [publish workflow](.github/workflows/publish.yml) runs the tests, packages the extension with that version, attaches the `.vsix` to a GitHub release, and publishes it:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+Publishing to the stores is skipped until you add their tokens as repository secrets (Settings → Secrets and variables → Actions):
+
+| Secret | Where to get it | Publishes to |
+|---|---|---|
+| `VSCE_PAT` | dev.azure.com → User settings → Personal access tokens; Organization **All accessible organizations**, scope **Marketplace → Manage** | VS Code Marketplace |
+| `OVSX_PAT` | open-vsx.org → Settings → Access Tokens (run `npx ovsx create-namespace NiloyBhattacharjee -p <token>` once first) | Open VSX (Cursor, VSCodium, Windsurf) |
 
 ## Test
 

@@ -5,6 +5,8 @@
   "version": "0.1.0",
   "publisher": "NiloyBhattacharjee",
   "license": "MIT",
+  "icon": "media/icon.png",
+  "galleryBanner": { "color": "#0b1120", "theme": "dark" },
   "repository": { "type": "git", "url": "https://github.com/NiloyBhattacharjee/agent-tracker" },
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other"],

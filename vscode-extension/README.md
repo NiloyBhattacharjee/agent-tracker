@@ -1,3 +1,5 @@
+<p align="center"><img src="media/icon.png" width="128" alt="AT logo"></p>
+
 # Agent Tracker for VS Code
 
 See every coding agent you have running, across all your projects, from the VS Code sidebar: **Claude Code** (terminal, VS Code, or desktop), **OpenAI Codex** (CLI or VS Code), and **GitHub Copilot Chat** agent sessions.
