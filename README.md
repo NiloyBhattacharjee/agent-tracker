@@ -6,23 +6,13 @@
 
 It tracks **Claude Code**, **OpenAI Codex**, and **GitHub Copilot Chat** agents, wherever they run: a terminal, VS Code, or the desktop app. It works on Windows, macOS, and Linux.
 
-```
- ◆ AGENT TRACKER   7 agents · 3 working · 2 need you · 1 conflicts · 52.4M tokens                16:35:12  ctrl+c to quit
+![The agents dashboard: two agents need you, a file conflict, Claude Code, Codex and Copilot agents side by side](docs/dashboard.gif)
 
-   AGENT        WHERE          PROJECT             MODEL         CONTEXT        TOTAL ERR  AGO    PID  DOING                              NEXT
- ⚠ 7be1c0d4     claude  vscode api-server          opus-5-5      ▰▱▱▱▱▱  212k    6.1M   ·  35s  20412  answer: Postgres or SQLite?        → Write migrations
- ⚠ c03a99f1     claude  cli    infra               sonnet-5-5    ▰▱▱▱▱▱   88k    2.4M   ·   2m   8088  approve? Bash: terraform apply
- ● 2f73ebd2 ⚡  claude  cli    api-server          opus-5-5      ▰▱▱▱▱▱   61k     549k   2   4s  32548  Bash: pnpm test auth               → Fix token refresh race
- ● 4cf2f29c ⚡  copilot vscode api-server          claude-opus-4 ▰▰▱▱▱▱   61k    1.2M   9  12s      ·  copilot_replaceString: users.ts    → Add pagination tests
- ● ↳ a91c03e2   claude  cli    api-server          haiku-5-5     ▱▱▱▱▱▱   22k     110k   ·  30s      ·  Grep: TODO\(auth\)
- ✓ 019c9278     codex   vscode web-frontend        gpt-5.3-codex ▰▰▰▰▰▱  174k    4.5M   1   6m      ·  apply_patch: Update File: App.tsx
- ○ 658f8a6e     codex   cli    data-pipeline       gpt-5.3-codex ▰▰▰▰▰▰  246k   23.0M   3   5h      ·  shell: python etl.py --dry-run
-   ⚡ src/routes/users.ts  edited by 2f73ebd2 (3m ago), 4cf2f29c (12s ago)
-```
-
-In a real terminal it's color-coded. The title bar turns **red** when an agent needs you or files conflict, and blocked agents jump to the top. ERR turns red when an agent is failing over and over. The context bar goes green, then yellow, then red as the window fills.
+It's color-coded. The title bar turns **red** when an agent needs you or files conflict, and blocked agents jump to the top. ERR turns red when an agent is failing over and over. The context bar goes green, then yellow, then red as the window fills.
 
 ## What it shows
+
+![The full dashboard table](docs/dashboard.png)
 
 | Column | Meaning |
 |---|---|
@@ -41,21 +31,7 @@ In a real terminal it's color-coded. The title bar turns **red** when an agent n
 
 Drill into one agent for a timestamped timeline of every command and file it touched (`✗` = failed, `…` = still pending), plus its full todo list:
 
-```
-$ agents 4cf2f29c
- ◆ 4cf2f29c-a5e8-4cd9-b336-4122b00f809b   claude  Add pagination to users API
-   ~/code/api-server  claude-sonnet-5-5  context ▰▱▱▱▱▱ 137k  total 18.5M  9 errors  ● working  pid 8088
-
-   10-23 14:14:13 · Read: src/routes/users.ts
-   10-23 14:14:23 · Edit: src/routes/users.ts
-   10-23 14:14:27 ✗ Bash: pnpm test users
-   10-23 14:14:41 … Bash: pnpm test users --reporter verbose
-
-   TODOS
-   ✔ Add limit/offset params
-   ▶ Write pagination tests
-   ○ Update OpenAPI spec
-```
+![Timeline of one agent: every command and file with timestamps, failed steps marked, and its todo list](docs/timeline.png)
 
 ## VS Code extension
 
@@ -102,15 +78,7 @@ How the signals are derived:
 
 ## Closing agents
 
-```
-$ agents --kill 4cf2f29c
-4cf2f29c  api-server  pid 8088  Add pagination to users API
-  working: Bash: pnpm test users
-  18.8M tokens
-Close this agent? Unsaved work in progress stops mid-step. [y/N] y
-closed 4cf2f29c (pid 8088). Its transcript is kept; resume it with:
-  cd ~/code/api-server && claude --resume 4cf2f29c-a5e8-4cd9-b336-4122b00f809b
-```
+![Closing an agent: shows what it is doing, asks to confirm, then prints the command to resume it](docs/kill.png)
 
 Claude Code records each running session in `~/.claude/sessions/<pid>.json`, including the process start time. Before closing anything, `agent-tracker` checks that the PID is still that exact process, so a PID the OS has reused for something else is never touched. On macOS and Linux it checks that the process is still a `claude`/`node` binary. It checks again right before killing. The agent's process and the shell commands it started are terminated (`taskkill /T` on Windows, `SIGTERM` elsewhere). The transcript stays, so `claude --resume` picks the session back up. Add `-y` to skip the confirmation.
 

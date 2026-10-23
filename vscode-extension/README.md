@@ -4,6 +4,8 @@
 
 See every coding agent you have running, across all your projects, from the VS Code sidebar: **Claude Code** (terminal, VS Code, or desktop), **OpenAI Codex** (CLI or VS Code), and **GitHub Copilot Chat** agent sessions.
 
+![The agents dashboard: agents that need you, a file conflict, Claude Code, Codex and Copilot side by side](https://raw.githubusercontent.com/NiloyBhattacharjee/agent-tracker/main/docs/dashboard.gif)
+
 - **Sidebar:** one row per agent with a status icon, its project, how full its context window is, and what it's doing right now. Expand a row to see its todo list and its last 30 actions (failed ones are marked).
 - **Status bar:** how many agents are working, how many **need you**, and how many **file conflicts** exist. It turns yellow when something needs your attention.
 - **Notifications** when an agent is blocked on a question or permission prompt, finishes its turn, or edits a file another agent is also editing.
