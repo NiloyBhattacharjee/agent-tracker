@@ -67,7 +67,7 @@ The same tracker as a VS Code sidebar, under [`vscode-extension/`](vscode-extens
 - **✕** on a row closes that agent (asks first); the **history** button opens its timeline; the **terminal** button opens the full live table
 - a filter button for **only this workspace's agents**
 
-Install it from the VS Code Marketplace (search **Agent Tracker**) once published, or download the `.vsix` from the [latest release](https://github.com/NiloyBhattacharjee/agent-tracker/releases/latest) and run `code --install-extension agent-tracker-*.vsix`.
+Install it from the VS Code Marketplace (search **AT Agent Tracker**) once published, or download the `.vsix` from the [latest release](https://github.com/NiloyBhattacharjee/agent-tracker/releases/latest) and run `code --install-extension agent-tracker-*.vsix`.
 
 To build it yourself (needs Node.js):
 
