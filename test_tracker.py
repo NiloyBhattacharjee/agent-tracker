@@ -84,6 +84,8 @@ a = run([
 ], tracker.parse_codex)
 assert (a["model"], a["tokens"], a["out"], a["ctx"], a["cap"]) == ("gpt-5.3-codex", 500, 50, 300, 258400), a
 assert a["compactions"] == 1
+assert tracker.left(a) == 258100  # Codex counts to its full window
+assert tracker.left(dict(src="claude", ctx=150_000, cap=200_000)) == 17_000  # Claude compacts 33k early
 # plan limits: newest snapshot wins; the weekly window already reset by `now`, so it's dropped
 assert tracker.codex_limits([a], 1770000000) == [("5h", 85.0, 1793000000)], tracker.codex_limits([a], 1770000000)
 assert tracker.codex_limits([], 0) == []

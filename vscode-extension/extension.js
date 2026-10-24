@@ -48,7 +48,7 @@ function agentItem(a) {
   const s = STATUS[a.status] || STATUS.idle;
   const it = item(a.project, s.icon, s.color, vscode.TreeItemCollapsibleState.Collapsed);
   it.id = a.id; // keeps expansion state across refreshes
-  it.description = `${full(a) ? '◔ ' : ''}${pct(a)}%${compacted(a)} · ${a.status === 'needs' ? a.detail : a.doing}`;
+  it.description = `${full(a) ? '◔ ' : ''}${pct(a)}% · ${fmtN(a.left)} left${compacted(a)} · ${a.status === 'needs' ? a.detail : a.doing}`;
   it.contextValue = a.pid ? 'agent-running' : 'agent';
   // transcript text is untrusted: appendText escapes it, and the tooltip isn't trusted to run command links
   const md = new vscode.MarkdownString('', true);
@@ -56,7 +56,7 @@ function agentItem(a) {
   line('**', a.title || a.project, '**');
   line(`$(${s.icon}) ${s.label}`, a.detail ? `: ${a.detail}` : '');
   line('', `${where(a)} · ${a.model || '?'} · ${a.id.slice(0, 8)}${a.pid ? ` · pid ${a.pid}` : ''} · last active ${ago(a.idle_secs)} ago`);
-  line('', `Context ${bar(a)} ${fmtN(a.ctx)} / ${fmtN(a.cap)} (${pct(a)}%) · ${fmtN(a.tokens)} tokens total`);
+  line('', `Context ${bar(a)} ${fmtN(a.ctx)} / ${fmtN(a.cap)} (${pct(a)}%, ${fmtN(a.left)} left before compacting) · ${fmtN(a.tokens)} tokens total`);
   if (a.compactions) line('', `Compacted ${a.compactions}× (older context was summarized, details may be lost)`);
   if (a.errors) line('', `${a.errors} failed tool calls${a.recent_errors >= 3 ? ', failing repeatedly' : ''}`);
   if (a.conflict) line('$(zap) ', 'edited a file another agent also edited');

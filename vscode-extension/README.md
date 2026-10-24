@@ -6,14 +6,14 @@ See every coding agent you have running, across all your projects, from the VS C
 
 ![The Agents sidebar: two agents need you, a file conflict, failing tests, and notifications](https://raw.githubusercontent.com/NiloyBhattacharjee/agent-tracker/main/docs/vscode.png)
 
-- **Sidebar:** one row per agent with a status icon, its project, how full its context window is (◔ past 80%, ⟳N = compacted N times), and what it's doing right now. Expand a row to see its todo list and its last 30 actions (failed ones are marked).
+- **Sidebar:** one row per agent with a status icon, its project, how full its context window is and how many tokens are left before it compacts (◔ past 80%, ⟳N = compacted N times), and what it's doing right now. Expand a row to see its todo list and its last 30 actions (failed ones are marked).
 - **Status bar:** how many agents are working, how many **need you**, how many **file conflicts** exist, and your **Codex plan usage** (if you use Codex). It turns yellow when something needs your attention.
 - **Notifications** when an agent is blocked on a question or permission prompt, finishes its turn, passes 80% of its context window, or edits a file another agent is also editing, and when a Codex plan window passes 80%.
 - **Close an agent** with the ✕ button on its row (Claude Code agents with a live process). You're asked first, and the session stays resumable with `claude --resume`.
 - **Timeline** button on a row: every command and file the agent touched, with timestamps.
 - **Terminal dashboard** button: the full-width live table in a terminal.
 
-Hover a row for details: model, context window (tokens used / window size), total tokens, failed tool calls, next todo item, and the working directory.
+Hover a row for details: model, context window (tokens used / window size, tokens left before compacting), total tokens, failed tool calls, next todo item, and the working directory.
 
 ## Requirements
 

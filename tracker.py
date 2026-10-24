@@ -514,6 +514,11 @@ def full(a):
     return a["ctx"] >= CTX_WARN * a["cap"]
 
 
+def left(a):
+    """Tokens until auto-compact: Claude Code compacts at window − 33k; others count to the full window."""
+    return max(0, a["cap"] - (33_000 if a["src"] == "claude" else 0) - a["ctx"])
+
+
 def doing_next(a):
     todo = lambda s: next((t for t in a["todos"] if t.get("status") == s), None)
     cur, nxt = todo("in_progress"), todo("pending")
@@ -577,7 +582,7 @@ def as_json(hours, proj):
             id=a["id"], src=a["src"], where=a["where"], sub=a["sub"], project=project(a), cwd=a["cwd"], title=a["title"],
             model=a["model"], status=st[a["path"]][0], detail=clip(st[a["path"]][1], 300), doing=clip(doing, 300),
             next=clip(nxt, 300), prompt=clip(a["prompt"], 500),
-            ctx=a["ctx"], cap=a["cap"], tokens=a["tokens"], out=a["out"], compactions=a["compactions"],
+            ctx=a["ctx"], cap=a["cap"], left=left(a), tokens=a["tokens"], out=a["out"], compactions=a["compactions"],
             errors=n_err, recent_errors=recent,
             idle_secs=int(now - a["mtime"]), pid=pids.get(a["id"]), conflict=a["path"] in clashing,
             events=[dict(ts=ts, action=clip(ev, 300), ok=ok) for ts, ev, ok, _ in a["events"][-30:]],
@@ -604,7 +609,7 @@ def table(hours, proj, sel=None, fit=None):
             f"{name} {bar(used, 100)} " + c("1;91" if used >= LIMIT_WARN else "1", f"{used:.0f}%") + c("90", f"  {resets(r, now)}")
             for name, used, r in limits))
     out.append("")
-    out.append(c("1;90", f"   {'AGENT':13}{'WHERE':15}{'PROJECT':20}{'MODEL':14}{'CONTEXT':16}{'TOTAL':>7}{'ERR':>4}"
+    out.append(c("1;90", f"   {'AGENT':13}{'WHERE':15}{'PROJECT':20}{'MODEL':14}{'CTX LEFT':16}{'TOTAL':>7}{'ERR':>4}"
                          f"{'AGO':>5}{'PID':>7}  {'DOING':{flex}}  NEXT"))
     icons = {"needs": c("1;91", "⚠"), "working": c("1;92", "●"), "done": c("36", "✓"), "idle": c("90", "○")}
     top = len(out) + 1
@@ -625,7 +630,7 @@ def table(hours, proj, sel=None, fit=None):
             + c(SRC_COLOR.get(a["src"], "37"), f"{a['src']:8}") + c("90", f"{clip(a['where'], 6):7}")
             + c(PALETTE[sum(map(ord, proj_name)) % len(PALETTE)], f"{clip(proj_name, 19):20}")
             + c("90", f"{clip(a['model'].replace('claude-', ''), 13):14}")
-            + bar(a["ctx"], a["cap"]) + f" {fmt_n(a['ctx']):>5} " + c("95", f"{compacted:3}")
+            + bar(a["ctx"], a["cap"]) + f" {fmt_n(left(a)):>5} " + c("95", f"{compacted:3}")
             + c("1", f"{fmt_n(a['tokens']):>7}") + err
             + c("92" if on else "90", f"{ago(now - a['mtime']):>5}")
             + (c("37", f"{pids[a['id']]:>7}") if a["id"] in pids else c("90", f"{'·':>7}")) + "  "
@@ -712,7 +717,7 @@ def timeline(prefix, n=40):
     print(c("1;97;44", f" ◆ {a['id']} ") + "  " + c(SRC_COLOR.get(a["src"], "37"), a["src"]) + "  " + c("1", a["title"] or "(untitled)"))
     state = {"needs": c("1;91", "⚠ needs you: " + detail), "working": c("1;92", "● working"),
              "done": c("36", "✓ done " + ago(now - a["mtime"])), "idle": c("90", "○ idle " + ago(now - a["mtime"]))}[kind]
-    print(f"   {c('36', a['cwd'])}  {c('90', a['model'])}  context {bar(a['ctx'], a['cap'])} {fmt_n(a['ctx'])}  "
+    print(f"   {c('36', a['cwd'])}  {c('90', a['model'])}  context {bar(a['ctx'], a['cap'])} {fmt_n(a['ctx'])} ({fmt_n(left(a))} left)  "
           f"total {c('1', fmt_n(a['tokens']))}  {compacted}{c('91', str(n_err) + ' errors') if n_err else ''}  {state}"
           f"{'  pid ' + str(pid) if pid else ''}\n")
     for ts, ev, ok, _ in a["events"][-n:]:

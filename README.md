@@ -21,7 +21,7 @@ It's color-coded. The title bar turns **red** when an agent needs you or files c
 | WHERE | which agent (`claude`, `codex`, `copilot`) and where it runs (`cli`, `vscode`, `desktop`, `exec`) |
 | PROJECT | the directory the agent is working in |
 | MODEL | model of the latest turn |
-| CONTEXT | how full the context window is right now: 1M for current Claude models, the window Codex reports, 200k otherwise. **⟳2** = it has compacted twice (older context was summarized, so it may have forgotten details) |
+| CTX LEFT | tokens left before the agent compacts (Claude Code compacts 33k before the window ends; others count to the full window). The bar shows how full the window is right now: 1M for current Claude models, the window Codex reports, 200k otherwise. **⟳2** = it has compacted twice (older context was summarized, so it may have forgotten details) |
 | TOTAL | all tokens processed, including cached input |
 | ERR | failed tool calls (non-zero exit codes, failed edits, rejected calls). **Red** = 3+ of its last 5 calls failed, so it's probably looping |
 | AGO | time since its last action |

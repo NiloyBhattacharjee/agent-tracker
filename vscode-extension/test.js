@@ -53,6 +53,7 @@ const ext = require('./extension');
   if (vscode.tree.data.agents.length) {
     const first = top.find(it => it.agent);
     assert(first.tooltip.value.includes('Context'), 'tooltip shows the context window');
+    assert(first.tooltip.value.includes(' left before compacting'), 'tooltip shows the remaining context');
     await vscode.cmds['agentTracker.timeline'](first);
     const doc = shown.find(s => s[0] === 'doc');
     assert(doc && doc[1].includes(first.agent.id), 'timeline document opened for the agent');
